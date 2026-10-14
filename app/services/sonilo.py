@@ -14,6 +14,7 @@ from loguru import logger
 from app.config import config
 from app.services import bgm as bgm_service
 from app.utils import utils
+from app.utils.download_deadline import DownloadDeadline, DownloadDeadlineExceeded
 
 
 DEFAULT_BASE_URL = "https://api.sonilo.com"
@@ -280,8 +281,13 @@ def _stream_audio(response: requests.Response, temp_audio_path: str) -> tuple[in
     total_bytes = 0
     title = ""
     completed = False
+    deadline = DownloadDeadline()
     with open(temp_audio_path, "wb") as output:
         for raw_line in _iter_bounded_events(response):
+            try:
+                deadline.check("Sonilo audio stream")
+            except DownloadDeadlineExceeded as exc:
+                raise SoniloError(str(exc)) from exc
             if not raw_line:
                 continue
             event = _parse_event(raw_line)

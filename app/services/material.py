@@ -1,9 +1,11 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 import math
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -31,6 +33,7 @@ from app.services import (
     volcengine_seedance,
 )
 from app.utils import logging_utils, utils
+from app.utils.download_deadline import DownloadDeadline
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
@@ -1156,6 +1159,12 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     # if video already exists, return the path
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         logger.info(f"video already exists: {video_path}")
+        try:
+            # Refresh mtime so cache_manager.sweep() evicts least recently
+            # *used* clips first rather than least recently downloaded.
+            os.utime(video_path)
+        except OSError:
+            pass
         return video_path
 
     headers = {
@@ -1195,7 +1204,12 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                 downloaded_bytes = 0
                 started_at = time.monotonic()
                 last_report_at = started_at
+                # ``timeout=(60, 240)`` is per socket read; a trickling server
+                # could keep this loop alive forever, so also enforce a total
+                # wall-clock budget. The temp file is removed in ``finally``.
+                deadline = DownloadDeadline()
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    deadline.check(f"video download {video_id}.mp4")
                     if chunk:
                         downloaded_bytes += len(chunk)
                         if downloaded_bytes > MAX_VIDEO_DOWNLOAD_BYTES:
@@ -1743,6 +1757,7 @@ def _download_videos_openai_image_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """
     按脚本片段顺序逐张生成 OpenAI 兼容文生图素材，凑够所需总时长立即停止。
@@ -1775,7 +1790,22 @@ def _download_videos_openai_image_on_demand(
         _persist_material_sources(task_id, material_sources)
         return video_paths
 
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, max(int(max_clip_duration), 1)
+    )
+    ledger_scope = ("openai_image", video_aspect, int(max_clip_duration))
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(max_clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             items = generate_images_openai(
                 search_term=search_term,
@@ -1786,6 +1816,16 @@ def _download_videos_openai_image_on_demand(
         except OpenAIImagePaidResultError:
             _persist_material_sources(task_id, material_sources)
             raise
+        if items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: no usable image for "
+                    f"{consecutive_misses} consecutive terms"
+                )
+                break
         for item in items:
             video_file = _render_openai_image_video(item.url, max_clip_duration)
             if not video_file:
@@ -1796,7 +1836,10 @@ def _download_videos_openai_image_on_demand(
             logger.info(f"image material rendered: {video_file}")
             video_paths.append(video_file)
             try:
-                material_sources.append(_material_source_record(item, video_file))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, video_file,
+                )
             except Exception as source_error:
                 # 与库存源一致：来源记录异常不能把已经付费生成并成功渲染的
                 # 素材当作失败，更不能阻断视频生成。
@@ -1819,6 +1862,9 @@ def _download_videos_openai_image_on_demand(
             break
 
     logger.success(f"generated and rendered {len(video_paths)} image materials")
+    _note_insufficient_materials(
+        warnings, "openai_image", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2141,9 +2187,15 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
     progress_callback: Callable[[float], None] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+    sentence_plan: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
+
+    ``warnings`` 可选：传入列表时，素材总时长不足以覆盖配音（剪辑阶段会循环
+    素材）会追加 ``insufficient_materials`` 警告。``sentence_plan`` 可选：库存
+    素材源按句子检索并排序，按叙事顺序返回片段（见 ``plan_sentence_queries``）。
 
     ``progress_callback`` 可选：库存素材（Pexels、Pixabay、Coverr）每下完一个
     文件就以 0~1 的完成比例调用一次，供任务层推进进度条。按需生成的付费
@@ -2188,7 +2240,7 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
+            material_directory=material_directory,            warnings=warnings,
         )
     if source == "volcengine_seedance":
         # 与 WaveSpeed 相同，方舟官方接口会创建异步付费任务。必须按需逐段
@@ -2199,7 +2251,7 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
+            material_directory=material_directory,            warnings=warnings,
         )
     if source == "ofox":
         # 与 WaveSpeed/方舟相同的按需付费语义：OFox 网关的 /v1/videos 会创建
@@ -2211,7 +2263,7 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
+            material_directory=material_directory,            warnings=warnings,
         )
     if source == "muapi":
         # MuAPI 的模型端点会创建异步付费任务。逐段提交并在覆盖配音时长后
@@ -2222,7 +2274,7 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
+            material_directory=material_directory,            warnings=warnings,
         )
     if source == "metaso_minimax":
         # 秘塔 MiniMax 同样按远端异步任务计费。它与火山方舟的请求体相似，
@@ -2234,7 +2286,7 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
+            material_directory=material_directory,            warnings=warnings,
         )
     if source == "openai_image":
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
@@ -2246,7 +2298,26 @@ def download_videos(
             video_aspect=video_aspect,
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
+            material_directory=material_directory,            warnings=warnings,
+        )
+
+    if sentence_plan:
+        aligned_paths = _download_videos_by_sentences(
+            task_id=task_id,
+            sentence_plan=sentence_plan,
+            search_videos=search_videos,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            progress_callback=progress_callback,
+            warnings_out=warnings,
+        )
+        if aligned_paths:
+            return aligned_paths
+        logger.warning(
+            "sentence-aligned selection found no footage, "
+            "falling back to keyword matching"
         )
 
     if match_script_order:
@@ -2259,6 +2330,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             progress_callback=progress_callback,
+            warnings=warnings,
         )
 
     valid_video_items = []
@@ -2345,7 +2417,550 @@ def download_videos(
                     f"detail={_redact_request_error(e, item.url)}"
                 )
     logger.success(f"downloaded {len(video_paths)} videos")
+    _note_insufficient_materials(warnings, source, audio_duration, total_duration)
     _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for paid (AI-generated) footage and coverage accounting.
+# ---------------------------------------------------------------------------
+
+# Upper bound on paid generations per task. A 60s narration with three videos
+# needs ~36 five-second clips, so the default leaves headroom while still
+# bounding cost. Override with ``max_ai_clips_per_task`` in ``[app]``.
+_DEFAULT_MAX_AI_CLIPS_PER_TASK = 40
+# Stop buying clips after this many consecutive rejected/empty generations so a
+# provider that rejects everything cannot burn the whole cap.
+_MAX_CONSECUTIVE_MISSES = 5
+# Slack allowed before declaring the narration under-covered.
+_COVERAGE_TOLERANCE_SECONDS = 0.5
+_REPEAT_TERM_VARIANTS = (
+    "different camera angle",
+    "close-up detail shot",
+    "wide establishing shot",
+    "alternate composition and lighting",
+)
+_CONTENT_REJECTION_MARKERS = (
+    "moderation",
+    "content policy",
+    "content_policy",
+    "contentpolicy",
+    "policy violation",
+    "sensitive",
+    "safety",
+    "nsfw",
+    "inappropriate",
+    "prohibited",
+    "审核",
+    "敏感",
+    "违规",
+)
+_PAID_LEDGER_FILE = "paid_clips.json"
+_paid_ledger_lock = threading.Lock()
+
+
+def _max_ai_clips_per_task() -> int:
+    try:
+        value = int(
+            config.app.get("max_ai_clips_per_task", _DEFAULT_MAX_AI_CLIPS_PER_TASK)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return _DEFAULT_MAX_AI_CLIPS_PER_TASK
+    return value if value >= 1 else _DEFAULT_MAX_AI_CLIPS_PER_TASK
+
+
+def _plan_ai_generation_terms(
+    search_terms: List[str],
+    required_duration: float,
+    clip_duration: int,
+) -> List[str]:
+    """
+    Expand the keyword list so enough clips can be generated to cover narration.
+
+    One clip per keyword leaves a long narration short (5 terms x 5s = 25s for a
+    180s requirement) and the editor then loops clips silently. The generation
+    loops stop as soon as the measured duration is covered, so planning extra
+    terms costs nothing unless they are needed. Repeats get a camera/composition
+    variant so the provider does not return near-identical footage. The result
+    never exceeds ``max_ai_clips_per_task``.
+    """
+    base = list(search_terms or [])
+    if not base:
+        return []
+    cap = _max_ai_clips_per_task()
+    needed = max(1, math.ceil(required_duration / max(clip_duration, 1)))
+    # Headroom: delivered clips can be shorter than requested.
+    target = min(cap, max(len(base), needed * 2))
+    if len(base) >= target:
+        return base[:cap]
+    planned = list(base)
+    for index in range(len(base), target):
+        repeat_round = index // len(base)
+        variant = _REPEAT_TERM_VARIANTS[(repeat_round - 1) % len(_REPEAT_TERM_VARIANTS)]
+        if repeat_round > len(_REPEAT_TERM_VARIANTS):
+            variant = f"{variant}, take {repeat_round}"
+        planned.append(f"{base[index % len(base)]}, {variant}")
+    return planned
+
+
+def _note_insufficient_materials(
+    warnings_out: list[dict[str, Any]] | None,
+    source: str,
+    required_duration: float,
+    covered_duration: float,
+) -> bool:
+    """Append an ``insufficient_materials`` warning when footage is too short."""
+    if covered_duration + _COVERAGE_TOLERANCE_SECONDS >= required_duration:
+        return False
+    logger.warning(
+        "materials do not cover the narration, clips will be repeated: "
+        f"source={source}, covered={covered_duration:.1f}s, "
+        f"required={required_duration:.1f}s"
+    )
+    if warnings_out is not None:
+        warnings_out.append(
+            {
+                "code": "insufficient_materials",
+                "source": source,
+                "required_duration": round(float(required_duration), 1),
+                "covered_duration": round(float(covered_duration), 1),
+            }
+        )
+    return True
+
+
+def _measure_clip_duration(video_path: str, fallback: float) -> float:
+    """Delivered duration of a downloaded clip; fall back to the requested one."""
+    try:
+        return _get_downloaded_video_duration(video_path)
+    except Exception as exc:
+        logger.warning(
+            "could not measure the delivered clip duration, using the requested "
+            f"one: path={video_path}, error={type(exc).__name__}"
+        )
+        return float(fallback)
+
+
+def _is_content_rejection(error: Exception) -> bool:
+    """True when a provider error says the prompt itself was refused."""
+    text = str(error).lower()
+    return any(marker in text for marker in _CONTENT_REJECTION_MARKERS)
+
+
+def _paid_ledger_path(task_id: str) -> Path:
+    return Path(utils.task_dir(task_id)) / _PAID_LEDGER_FILE
+
+
+def _paid_ledger_key(
+    provider: str, video_aspect: VideoAspect, clip_duration: int, search_term: str
+) -> str:
+    aspect = VideoAspect(video_aspect).value
+    return f"{provider}|{aspect}|{int(clip_duration)}|{search_term}"
+
+
+def _read_paid_ledger(task_id: str) -> dict[str, dict[str, Any]]:
+    try:
+        with _paid_ledger_path(task_id).open("r", encoding="utf-8") as ledger_file:
+            data = json.load(ledger_file)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning(
+            f"ignoring unreadable paid clip ledger: task_id={task_id}, "
+            f"error={type(exc).__name__}"
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _append_paid_source(
+    task_id: str,
+    ledger_scope: tuple[str, VideoAspect, int],
+    search_term: str,
+    material_sources: list[dict[str, Any]],
+    item: MaterialInfo,
+    local_path: str,
+) -> None:
+    """
+    Record a paid clip in ``material_sources`` and in a per-task ledger.
+
+    The ledger (``paid_clips.json`` in the task directory) is written as soon as
+    a clip is downloaded and is not overwritten by script regeneration, so a
+    retry of the same task id can reuse the clip and its provider asset id
+    instead of paying for a new generation.
+    """
+    record = _material_source_record(item, local_path)
+    material_sources.append(record)
+    provider, video_aspect, clip_duration = ledger_scope
+    with _paid_ledger_lock:
+        ledger = _read_paid_ledger(task_id)
+        ledger[_paid_ledger_key(provider, video_aspect, clip_duration, search_term)] = record
+        target = _paid_ledger_path(task_id)
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
+                json.dump(ledger, temp_file, ensure_ascii=False)
+            os.replace(temp_path, target)
+            temp_path = ""
+        except Exception as exc:
+            logger.warning(
+                f"failed to write paid clip ledger: task_id={task_id}, "
+                f"error={type(exc).__name__}, detail={exc}"
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+
+def _reuse_paid_clip(
+    task_id: str,
+    ledger_scope: tuple[str, VideoAspect, int],
+    search_term: str,
+    material_directory: str,
+) -> tuple[str, dict[str, Any], float] | None:
+    """Return (path, source record, duration) of an earlier paid clip, if intact."""
+    provider, video_aspect, clip_duration = ledger_scope
+    record = _read_paid_ledger(task_id).get(
+        _paid_ledger_key(provider, video_aspect, clip_duration, search_term)
+    )
+    if not isinstance(record, dict):
+        return None
+    local_file = record.get("local_file")
+    if not isinstance(local_file, str) or not local_file or local_file != Path(local_file).name:
+        return None
+    candidate = os.path.join(material_directory, local_file)
+    try:
+        if not os.path.isfile(candidate) or os.path.getsize(candidate) <= 0:
+            return None
+    except OSError:
+        return None
+    seconds = _measure_clip_duration(candidate, record.get("duration") or clip_duration)
+    logger.info(
+        "reusing a clip already paid for by this task: "
+        f"provider={provider}, asset_id={record.get('asset_id') or 'unknown'}"
+    )
+    return candidate, record, seconds
+
+
+# ---------------------------------------------------------------------------
+# Sentence-aligned stock footage selection.
+# ---------------------------------------------------------------------------
+
+STOCK_SOURCES = frozenset({"pexels", "pixabay", "coverr"})
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s*|[\n\r]+")
+
+
+def split_script_sentences(script: str) -> list[str]:
+    """Split narration into sentences (Latin and CJK punctuation, newlines)."""
+    text = utils.remove_pause_tags(script or "")
+    return [part.strip() for part in _SENTENCE_BOUNDARY.split(text) if part and part.strip()]
+
+
+def sentence_alignment_enabled(match_materials_to_script: Any = False) -> bool:
+    """
+    Whether sentence-aligned selection should be attempted.
+
+    On when the request asks for script matching, and also by default
+    (``match_materials_to_script_default`` in ``[app]``, default True) whenever
+    sentence queries can be produced. The planner itself returns None when no
+    generator is available, so the caller falls back to keyword logic.
+    """
+    if bool(match_materials_to_script):
+        return True
+    default = config.app.get("match_materials_to_script_default", True)
+    if isinstance(default, str):
+        return default.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(default)
+
+
+def _query_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [part.strip() for part in value if isinstance(part, str) and part.strip()]
+
+
+def normalize_sentence_plan(script: str, raw: Any) -> list[dict[str, Any]] | None:
+    """
+    Normalize ``llm.generate_sentence_queries`` output into plan entries.
+
+    Accepts a list of query strings (aligned to the script's sentences), a list
+    of ``{"sentence": ..., "queries"|"query"|"terms": ...}`` dicts, or
+    ``(sentence, queries)`` pairs. Each entry becomes
+    ``{"sentence": str, "queries": [str], "weight": float}``. Returns None when
+    nothing usable is present.
+    """
+    if isinstance(raw, dict):
+        raw = raw.get("sentences") or raw.get("items") or raw.get("queries")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    sentences = split_script_sentences(script)
+    aligned_by_index = len(sentences) == len(raw)
+
+    entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        sentence = sentences[index] if aligned_by_index else ""
+        queries: list[str] = []
+        if isinstance(entry, str):
+            queries = _query_list(entry)
+        elif isinstance(entry, dict):
+            text = entry.get("sentence") or entry.get("text")
+            if isinstance(text, str) and text.strip():
+                sentence = text.strip()
+            for key in ("queries", "query", "terms", "term"):
+                queries = _query_list(entry.get(key))
+                if queries:
+                    break
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+            text, value = entry
+            if isinstance(text, str) and text.strip():
+                sentence = text.strip()
+            queries = _query_list(value)
+        if queries:
+            entries.append({"sentence": sentence, "queries": queries})
+    if not entries:
+        return None
+
+    known = [len(item["sentence"]) for item in entries if item["sentence"]]
+    fallback_weight = (sum(known) / len(known)) if known else 1.0
+    for item in entries:
+        item["weight"] = float(len(item["sentence"]) or fallback_weight)
+    return entries
+
+
+def plan_sentence_queries(script: str) -> list[dict[str, Any]] | None:
+    """
+    Ask the LLM layer for one search query per sentence, if it supports that.
+
+    ``generate_sentence_queries`` lives in a different change set, so it is
+    looked up dynamically; absence or any failure returns None and the caller
+    falls back to the keyword-based flow.
+    """
+    from app.services import llm
+
+    generator = getattr(llm, "generate_sentence_queries", None)
+    if not callable(generator) or not (script or "").strip():
+        return None
+    try:
+        raw = generator(utils.remove_pause_tags(script))
+    except Exception as exc:
+        logger.warning(
+            "sentence query generation failed, using keyword matching: "
+            f"error={type(exc).__name__}, detail={exc}"
+        )
+        return None
+    return normalize_sentence_plan(script, raw)
+
+
+def _material_key(item: MaterialInfo) -> str:
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    asset_id = source.get("asset_id")
+    if asset_id not in (None, ""):
+        return f"{item.provider}:{asset_id}"
+    return item.url.split("#", 1)[0]
+
+
+def _score_sentence_candidate(
+    item: MaterialInfo,
+    rank: int,
+    result_count: int,
+    needed: float,
+    video_aspect: VideoAspect,
+) -> float:
+    """Higher is better: provider relevance rank, duration fit, resolution, aspect."""
+    target_width, target_height = VideoAspect(video_aspect).to_resolution()
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    rendition = source.get("rendition") if isinstance(source.get("rendition"), dict) else {}
+    try:
+        width = float(rendition.get("width"))
+        height = float(rendition.get("height"))
+    except (TypeError, ValueError):
+        width = height = 0.0
+
+    if width > 0 and height > 0:
+        area_score = min(1.0, (width * height) / (target_width * target_height))
+        ratio = (width / height) / (target_width / target_height)
+        aspect_score = 1.0 / (1.0 + abs(math.log(ratio)))
+    else:
+        area_score = 0.5
+        aspect_score = 0.5
+
+    duration = float(item.duration or 0)
+    duration_score = 1.0 if duration >= needed or duration <= 0 else duration / needed
+    rank_score = 1.0 - rank / max(result_count, 1)
+    return 3.0 * rank_score + 2.0 * duration_score + 1.5 * area_score + 1.0 * aspect_score
+
+
+def select_sentence_clips(
+    plan: list[dict[str, Any]],
+    results_by_query: dict[str, List[MaterialInfo]],
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+    audio_duration: float,
+) -> list[dict[str, Any]]:
+    """
+    Choose clips per sentence, in narrative order, with a target duration each.
+
+    Every sentence gets a share of ``audio_duration`` proportional to its
+    length. Candidates are ranked (see ``_score_sentence_candidate``); a clip is
+    never used twice -- if a sentence runs out of its own candidates, unused
+    candidates from other sentences fill in (at a relevance penalty), and if
+    nothing unused is left the sentence stays short rather than looping.
+    """
+    total_weight = sum(entry["weight"] for entry in plan) or 1.0
+    candidates_by_sentence: list[list[tuple[MaterialInfo, str, int, int]]] = []
+    for entry in plan:
+        candidates = []
+        for query in entry["queries"]:
+            items = results_by_query.get(query) or []
+            for rank, item in enumerate(items):
+                candidates.append((item, query, rank, len(items)))
+        candidates_by_sentence.append(candidates)
+
+    used: set[str] = set()
+    selections: list[dict[str, Any]] = []
+    for index, entry in enumerate(plan):
+        remaining = audio_duration * entry["weight"] / total_weight
+        while remaining > 0.05:
+            needed = min(float(max_clip_duration), remaining)
+            best = None
+            best_score = -math.inf
+            for item, query, rank, count in candidates_by_sentence[index]:
+                if _material_key(item) in used:
+                    continue
+                score = _score_sentence_candidate(item, rank, count, needed, video_aspect)
+                if score > best_score:
+                    best, best_score = (item, query), score
+            if best is None:
+                for other_index, others in enumerate(candidates_by_sentence):
+                    if other_index == index:
+                        continue
+                    for item, query, rank, count in others:
+                        if _material_key(item) in used:
+                            continue
+                        score = (
+                            _score_sentence_candidate(item, rank, count, needed, video_aspect)
+                            - 5.0
+                        )
+                        if score > best_score:
+                            best, best_score = (item, query), score
+            if best is None:
+                break
+            item, query = best
+            used.add(_material_key(item))
+            usable = min(float(max_clip_duration), float(item.duration or max_clip_duration))
+            selections.append(
+                {
+                    "sentence_index": index,
+                    "sentence": entry["sentence"],
+                    "query": query,
+                    "item": item,
+                    "target_duration": round(needed, 2),
+                }
+            )
+            remaining -= usable
+    return selections
+
+
+def _download_videos_by_sentences(
+    *,
+    task_id: str,
+    sentence_plan: list[dict[str, Any]],
+    search_videos,
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+    progress_callback: Callable[[float], None] | None = None,
+    warnings_out: list[dict[str, Any]] | None = None,
+) -> List[str]:
+    """
+    Search stock footage per sentence, rank, download, and return narrative-order paths.
+
+    Returns an empty list when nothing could be selected or downloaded so the
+    caller can fall back to the keyword flow. The per-clip target durations are
+    stored in ``script.json`` under ``sentence_alignment``.
+    """
+    queries = list(dict.fromkeys(q for entry in sentence_plan for q in entry["queries"]))
+    results_by_query = {
+        term: items
+        for term, items in _search_terms_in_parallel(
+            search_terms=queries,
+            search_videos=search_videos,
+            minimum_duration=max_clip_duration,
+            video_aspect=video_aspect,
+        )
+    }
+    selections = select_sentence_clips(
+        sentence_plan, results_by_query, video_aspect, max_clip_duration, audio_duration
+    )
+    if not selections:
+        return []
+    logger.info(
+        f"sentence-aligned selection: sentences={len(sentence_plan)}, "
+        f"clips={len(selections)}, required duration: {audio_duration} seconds"
+    )
+
+    by_item = {id(selection["item"]): selection for selection in selections}
+    downloaded = _download_materials_in_parallel(
+        materials=[(s["query"], s["item"]) for s in selections],
+        material_directory=material_directory,
+        on_downloaded=_covered_duration_reporter(
+            progress_callback, audio_duration, max_clip_duration
+        ),
+    )
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    alignment: list[dict[str, Any]] = []
+    covered = 0.0
+    for _, item, saved_video_path in downloaded:
+        selection = by_item.get(id(item))
+        if not saved_video_path or selection is None:
+            continue
+        video_paths.append(saved_video_path)
+        covered += min(max_clip_duration, item.duration or max_clip_duration)
+        try:
+            material_sources.append(_material_source_record(item, saved_video_path))
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare aligned material source record: "
+                f"provider={item.provider}, error={type(source_error).__name__}"
+            )
+        alignment.append(
+            {
+                "local_file": Path(saved_video_path).name,
+                "sentence_index": selection["sentence_index"],
+                "sentence": selection["sentence"],
+                "query": selection["query"],
+                "target_duration": selection["target_duration"],
+            }
+        )
+
+    _persist_material_sources(task_id, material_sources)
+    if alignment:
+        try:
+            task_artifacts.patch_script_data(task_id, sentence_alignment=alignment)
+        except Exception as exc:
+            logger.warning(f"failed to save sentence alignment: {type(exc).__name__}")
+    _note_insufficient_materials(warnings_out, "sentence_aligned", audio_duration, covered)
+    if video_paths:
+        for entry in sentence_plan:
+            entry["aligned"] = True
+    logger.success(f"downloaded {len(video_paths)} sentence-aligned videos")
     return video_paths
 
 
@@ -2357,6 +2972,7 @@ def _download_videos_wavespeed_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """
     按脚本片段顺序逐段生成 WaveSpeed 素材，凑够所需总时长立即停止。
@@ -2391,8 +3007,27 @@ def _download_videos_wavespeed_on_demand(
     if clip_duration <= 0:
         raise ValueError("WaveSpeed clip duration must be a positive integer")
 
+    if not material_directory:
+        # Paid clips belong to the task: keep them out of the shared, swept
+        # cache and next to the ledger that lets a retry reuse them.
+        material_directory = utils.task_dir(task_id)
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, clip_duration
+    )
+    ledger_scope = ("wavespeed", video_aspect, clip_duration)
     total_duration = 0.0
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             video_items = generate_videos_wavespeed(
                 search_term=search_term,
@@ -2410,6 +3045,17 @@ def _download_videos_wavespeed_on_demand(
             )
             _persist_material_sources(task_id, material_sources)
             raise
+        if video_items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: the provider returned no usable clip for "
+                    f"{consecutive_misses} consecutive terms: source=wavespeed"
+                )
+                break
+
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
                 item.url, material_directory, "wavespeed"
@@ -2426,9 +3072,14 @@ def _download_videos_wavespeed_on_demand(
                     prediction_id=prediction_id,
                 )
             logger.info(f"video saved: {saved_video_path}")
+            # Count what the provider actually delivered, not what was requested.
+            item.duration = _measure_clip_duration(saved_video_path, item.duration)
             video_paths.append(saved_video_path)
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, saved_video_path,
+                )
             except Exception as source_error:
                 # 与库存源一致：来源记录异常不能把已经付费生成并成功下载的
                 # 素材当作失败，更不能阻断视频生成。
@@ -2450,6 +3101,9 @@ def _download_videos_wavespeed_on_demand(
             )
             break
     logger.success(f"generated and downloaded {len(video_paths)} videos")
+    _note_insufficient_materials(
+        warnings, "wavespeed", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2462,6 +3116,7 @@ def _download_videos_seedance_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """顺序生成方舟 Seedance 素材，覆盖配音时长后立即停止付费下单。"""
     video_paths: List[str] = []
@@ -2499,8 +3154,27 @@ def _download_videos_seedance_on_demand(
             "Seedance clip duration must be a positive integer"
         )
 
+    if not material_directory:
+        # Paid clips belong to the task: keep them out of the shared, swept
+        # cache and next to the ledger that lets a retry reuse them.
+        material_directory = utils.task_dir(task_id)
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, clip_duration
+    )
+    ledger_scope = ("volcengine_seedance", video_aspect, clip_duration)
     total_duration = 0.0
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             video_items = volcengine_seedance.generate_videos(
                 search_term=search_term,
@@ -2517,9 +3191,30 @@ def _download_videos_seedance_on_demand(
             _persist_material_sources(task_id, material_sources)
             raise
         except volcengine_seedance.VolcEngineSeedanceError as exc:
-            logger.error(f"Seedance generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
+            if _is_content_rejection(exc):
+                # The prompt was refused (moderation / content policy). The
+                # remote task is finished, so skip this term and keep going;
+                # clips already paid for stay in ``video_paths``.
+                logger.warning(
+                    f"Seedance rejected a term, skipping it: term={search_term!r}, "
+                    f"detail={exc}"
+                )
+                video_items = []
+            else:
+                logger.error(f"Seedance generation failed before completion: {exc}")
+                _persist_material_sources(task_id, material_sources)
+                raise
+
+        if video_items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: the provider returned no usable clip for "
+                    f"{consecutive_misses} consecutive terms: source=volcengine_seedance"
+                )
+                break
 
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
@@ -2540,9 +3235,14 @@ def _download_videos_seedance_on_demand(
                     task_id=remote_task_id,
                 )
             logger.info(f"video saved: {saved_video_path}")
+            # Count what the provider actually delivered, not what was requested.
+            item.duration = _measure_clip_duration(saved_video_path, item.duration)
             video_paths.append(saved_video_path)
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, saved_video_path,
+                )
             except Exception as source_error:
                 logger.warning(
                     "failed to prepare generated material source record: "
@@ -2563,6 +3263,9 @@ def _download_videos_seedance_on_demand(
     logger.success(
         f"generated and downloaded {len(video_paths)} Volcano Engine Seedance videos"
     )
+    _note_insufficient_materials(
+        warnings, "volcengine_seedance", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2575,6 +3278,7 @@ def _download_videos_ofox_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """顺序生成 OFox 素材，覆盖配音时长后立即停止付费下单。"""
     video_paths: List[str] = []
@@ -2604,8 +3308,27 @@ def _download_videos_ofox_on_demand(
     if clip_duration <= 0:
         raise ofox.OFoxError("OFox clip duration must be a positive integer")
 
+    if not material_directory:
+        # Paid clips belong to the task: keep them out of the shared, swept
+        # cache and next to the ledger that lets a retry reuse them.
+        material_directory = utils.task_dir(task_id)
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, clip_duration
+    )
+    ledger_scope = ("ofox", video_aspect, clip_duration)
     total_duration = 0.0
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             video_items = ofox.generate_videos(
                 search_term=search_term,
@@ -2628,6 +3351,17 @@ def _download_videos_ofox_on_demand(
 
         # 单个关键词被远端明确判失败（如触发内容审核）时返回空列表：任务已
         # 结束、无计费悬念，跳过该片段继续生成后续关键词。
+        if video_items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: the provider returned no usable clip for "
+                    f"{consecutive_misses} consecutive terms: source=ofox"
+                )
+                break
+
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
                 item.url, material_directory, "ofox"
@@ -2647,9 +3381,14 @@ def _download_videos_ofox_on_demand(
                     task_id=remote_task_id,
                 )
             logger.info(f"video saved: {saved_video_path}")
+            # Count what the provider actually delivered, not what was requested.
+            item.duration = _measure_clip_duration(saved_video_path, item.duration)
             video_paths.append(saved_video_path)
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, saved_video_path,
+                )
             except Exception as source_error:
                 logger.warning(
                     "failed to prepare generated material source record: "
@@ -2668,6 +3407,9 @@ def _download_videos_ofox_on_demand(
             break
 
     logger.success(f"generated and downloaded {len(video_paths)} OFox videos")
+    _note_insufficient_materials(
+        warnings, "ofox", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2680,6 +3422,7 @@ def _download_videos_muapi_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """Generate MuAPI materials until the narration duration is covered."""
     video_paths: List[str] = []
@@ -2710,8 +3453,27 @@ def _download_videos_muapi_on_demand(
     if clip_duration <= 0:
         raise muapi.MuAPIError("MuAPI clip duration must be a positive integer")
 
+    if not material_directory:
+        # Paid clips belong to the task: keep them out of the shared, swept
+        # cache and next to the ledger that lets a retry reuse them.
+        material_directory = utils.task_dir(task_id)
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, clip_duration
+    )
+    ledger_scope = ("muapi", video_aspect, clip_duration)
     total_duration = 0.0
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             video_items = muapi.generate_videos(
                 search_term=search_term,
@@ -2734,6 +3496,17 @@ def _download_videos_muapi_on_demand(
             _persist_material_sources(task_id, material_sources)
             raise
 
+        if video_items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: the provider returned no usable clip for "
+                    f"{consecutive_misses} consecutive terms: source=muapi"
+                )
+                break
+
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
                 item.url, material_directory, "muapi"
@@ -2755,7 +3528,10 @@ def _download_videos_muapi_on_demand(
             logger.info(f"video saved: {saved_video_path}")
             video_paths.append(saved_video_path)
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, saved_video_path,
+                )
             except Exception as source_error:
                 logger.warning(
                     "failed to prepare generated material source record: "
@@ -2776,6 +3552,7 @@ def _download_videos_muapi_on_demand(
                     f"id={remote_task_id or 'unknown'}",
                     task_id=remote_task_id,
                 ) from duration_error
+            item.duration = downloaded_duration
             total_duration += min(clip_duration, downloaded_duration)
             if total_duration >= required_duration:
                 break
@@ -2788,6 +3565,9 @@ def _download_videos_muapi_on_demand(
             break
 
     logger.success(f"generated and downloaded {len(video_paths)} MuAPI videos")
+    _note_insufficient_materials(
+        warnings, "muapi", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2800,6 +3580,7 @@ def _download_videos_metaso_minimax_on_demand(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """顺序生成秘塔 MiniMax 素材，覆盖配音时长后立即停止付费下单。"""
     video_paths: List[str] = []
@@ -2837,8 +3618,27 @@ def _download_videos_metaso_minimax_on_demand(
             "Metaso MiniMax clip duration must be a positive integer"
         )
 
+    if not material_directory:
+        # Paid clips belong to the task: keep them out of the shared, swept
+        # cache and next to the ledger that lets a retry reuse them.
+        material_directory = utils.task_dir(task_id)
+    search_terms = _plan_ai_generation_terms(
+        search_terms, required_duration, clip_duration
+    )
+    ledger_scope = ("metaso_minimax", video_aspect, clip_duration)
     total_duration = 0.0
+    consecutive_misses = 0
     for search_term in search_terms:
+        reused = _reuse_paid_clip(task_id, ledger_scope, search_term, material_directory)
+        if reused is not None:
+            reused_path, reused_record, reused_seconds = reused
+            video_paths.append(reused_path)
+            material_sources.append(reused_record)
+            total_duration += min(clip_duration, reused_seconds)
+            consecutive_misses = 0
+            if total_duration >= required_duration:
+                break
+            continue
         try:
             video_items = metaso_minimax.generate_videos(
                 search_term=search_term,
@@ -2856,9 +3656,29 @@ def _download_videos_metaso_minimax_on_demand(
             _persist_material_sources(task_id, material_sources)
             raise
         except metaso_minimax.MetasoMiniMaxError as exc:
-            logger.error(f"Metaso MiniMax generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
+            if _is_content_rejection(exc):
+                logger.warning(
+                    "Metaso MiniMax rejected a term, skipping it: "
+                    f"term={search_term!r}, detail={exc}"
+                )
+                video_items = []
+            else:
+                logger.error(
+                    f"Metaso MiniMax generation failed before completion: {exc}"
+                )
+                _persist_material_sources(task_id, material_sources)
+                raise
+
+        if video_items:
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= _MAX_CONSECUTIVE_MISSES:
+                logger.error(
+                    "stop generating: the provider returned no usable clip for "
+                    f"{consecutive_misses} consecutive terms: source=metaso_minimax"
+                )
+                break
 
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
@@ -2878,9 +3698,14 @@ def _download_videos_metaso_minimax_on_demand(
                     task_id=remote_task_id,
                 )
             logger.info(f"video saved: {saved_video_path}")
+            # Count what the provider actually delivered, not what was requested.
+            item.duration = _measure_clip_duration(saved_video_path, item.duration)
             video_paths.append(saved_video_path)
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
+                _append_paid_source(
+                    task_id, ledger_scope, search_term, material_sources,
+                    item, saved_video_path,
+                )
             except Exception as source_error:
                 logger.warning(
                     "failed to prepare generated material source record: "
@@ -2902,6 +3727,9 @@ def _download_videos_metaso_minimax_on_demand(
             break
 
     logger.success(f"generated and downloaded {len(video_paths)} Metaso MiniMax videos")
+    _note_insufficient_materials(
+        warnings, "metaso_minimax", required_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -2915,6 +3743,7 @@ def _download_videos_by_script_order(
     max_clip_duration: int,
     material_directory: str,
     progress_callback: Callable[[float], None] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
@@ -3032,6 +3861,9 @@ def _download_videos_by_script_order(
                 )
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")
+    _note_insufficient_materials(
+        warnings, "script_order", audio_duration, total_duration
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
