@@ -70,6 +70,8 @@ source = ["app", "cli", "webui", "main", "docs/skill"]
 fail_under = 70
 show_missing = true
 skip_covered = true
+[tool.pytest.ini_options]
+markers = ["slow: real FFmpeg render tests, run only with RUN_SLOW=1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
