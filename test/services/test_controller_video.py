@@ -90,7 +90,10 @@ class TestVideoControllerHelpers(unittest.TestCase):
         """API 进程启动时必须执行一次发布遗留状态恢复。"""
         from app.services import task as task_service
 
-        with patch.object(task_service, "recover_interrupted_cross_posts") as recover:
+        with (
+            patch.object(task_service, "recover_interrupted_cross_posts") as recover,
+            patch.object(task_service, "recover_interrupted_tasks") as recover_tasks,
+        ):
 
             async def run_lifespan():
                 async with asgi.application_lifespan(asgi.app):
@@ -99,6 +102,7 @@ class TestVideoControllerHelpers(unittest.TestCase):
             asyncio.run(run_lifespan())
 
         recover.assert_called_once_with()
+        recover_tasks.assert_called_once_with()
 
     def test_fastapi_startup_resumes_persisted_redis_queue(self):
         """A restart must dispatch queued Redis work before serving requests."""
@@ -111,6 +115,7 @@ class TestVideoControllerHelpers(unittest.TestCase):
             patch.object(video_controller, "task_manager", manager),
             patch.object(manager, "check_queue") as check_queue,
             patch.object(task_service, "recover_interrupted_cross_posts"),
+            patch.object(task_service, "recover_interrupted_tasks"),
         ):
             async def run_lifespan():
                 async with asgi.application_lifespan(asgi.app):

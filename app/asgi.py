@@ -43,6 +43,8 @@ async def application_lifespan(_: FastAPI):
     from app.services import task as task_service
 
     task_service.recover_interrupted_cross_posts()
+    # 同理，执行进程已退出的视频任务也不会继续运行，需要在恢复队列前收敛。
+    task_service.recover_interrupted_tasks()
 
     # Redis queue entries persist across API restarts. No task_done callback
     # exists in the new process to dispatch them, so fill its worker slots now.

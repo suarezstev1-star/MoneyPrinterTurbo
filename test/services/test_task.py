@@ -2323,6 +2323,65 @@ class TestTaskService(unittest.TestCase):
         )
         active_future.set_result(None)
 
+    def test_recover_interrupted_tasks_fails_only_orphaned_processing_tasks(self):
+        """启动恢复只收敛执行进程已退出的任务，排队、远程和存活进程的任务保持原状。"""
+        state = MemoryState()
+        dead_owner = f"{tm.socket.gethostname()}:999999:dead"
+        live_owner = f"{tm.socket.gethostname()}:4242:live"
+        tasks = {
+            "orphaned": (tm.const.TASK_STATE_PROCESSING, dead_owner),
+            "queued-without-owner": (tm.const.TASK_STATE_PROCESSING, None),
+            "current-process": (
+                tm.const.TASK_STATE_PROCESSING,
+                tm._cross_post_process_owner,
+            ),
+            "other-live-process": (tm.const.TASK_STATE_PROCESSING, live_owner),
+            "remote-host": (tm.const.TASK_STATE_PROCESSING, "another-host:1:x"),
+            "completed": (tm.const.TASK_STATE_COMPLETE, dead_owner),
+        }
+        for task_id, (task_state, owner) in tasks.items():
+            fields = {"task_owner": owner} if owner else {}
+            state.update_task(task_id, state=task_state, progress=40, **fields)
+
+        def owner_alive(owner):
+            return owner != dead_owner
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "_is_cross_post_owner_alive", side_effect=owner_alive),
+        ):
+            recovered = tm.recover_interrupted_tasks(page_size=1)
+
+        self.assertEqual(recovered, 1)
+        orphaned = state.get_task("orphaned")
+        self.assertEqual(orphaned["state"], tm.const.TASK_STATE_FAILED)
+        self.assertEqual(orphaned["failed_stage"], "interrupted")
+        self.assertEqual(orphaned["error"], tm._INTERRUPTED_TASK_ERROR)
+        self.assertEqual(orphaned["progress"], 40)
+        self.assertIsNone(orphaned["task_owner"])
+        self.assertFalse(tm.is_task_busy(orphaned))
+        for task_id in (
+            "queued-without-owner",
+            "current-process",
+            "other-live-process",
+            "remote-host",
+        ):
+            self.assertEqual(
+                state.get_task(task_id)["state"],
+                tm.const.TASK_STATE_PROCESSING,
+                task_id,
+            )
+        self.assertEqual(
+            state.get_task("completed")["state"], tm.const.TASK_STATE_COMPLETE
+        )
+
+    def test_recover_interrupted_tasks_reports_state_errors(self):
+        """状态后端不可用时恢复返回 None，不能阻止 API 启动。"""
+        broken_state = MagicMock()
+        broken_state.list_task_ids.side_effect = RuntimeError("redis down")
+        with patch.object(tm.sm, "state", broken_state):
+            self.assertIsNone(tm.recover_interrupted_tasks())
+
     def test_recover_interrupted_cross_posts_scans_ids_only_once(self):
         """启动恢复不能依赖多次独立扫描的分页顺序。"""
         state = MemoryState()

@@ -67,6 +67,9 @@ _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
     "cross-posting was interrupted before the process completed"
 )
+_INTERRUPTED_TASK_ERROR = (
+    "video generation was interrupted because the process running it exited"
+)
 # Map upload-post platform ids to the social platform names llm.py accepts.
 _CROSS_POST_SOCIAL_PLATFORMS = {
     "tiktok": "tiktok",
@@ -283,6 +286,9 @@ def _mark_task_failed(
         "failed_stage": stage,
         "error": message,
     }
+    # 任务已结束，清除执行进程标记，返回值与持久化状态保持一致。
+    if existing_task and existing_task.get("task_owner"):
+        failure["task_owner"] = None
     # 某些外部任务已经创建了可用于恢复或排障的远端 ID。失败状态需要保留
     # 这些非敏感字段，但不能允许调用方覆盖统一的状态、进度和错误结构。
     # Keep completed batch outputs in both the persisted state and the direct
@@ -1247,6 +1253,55 @@ def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
     return recovered
 
 
+def recover_interrupted_tasks(page_size: int = 100) -> int | None:
+    """
+    将执行进程已退出、却仍停留在 processing 的视频任务标记为失败。
+
+    流水线在当前进程的线程中运行，进程重启后不会继续执行；残留的 processing
+    状态会让任务永久无法删除。只处理带 task_owner 的记录：排队中的任务和
+    旧版本创建的任务没有 owner，无法判断归属，保持原状。其它主机或仍存活
+    进程（例如同时运行的 WebUI）持有的任务同样不能被误伤。
+    """
+    recovered = 0
+    try:
+        task_ids = sm.state.list_task_ids(scan_count=page_size)
+        for task_id in task_ids:
+            task = sm.state.get_task(task_id)
+            if not task:
+                continue
+            state = task.get("state")
+            try:
+                state = int(state)
+            except (TypeError, ValueError):
+                pass
+            owner = task.get("task_owner")
+            if (
+                state != const.TASK_STATE_PROCESSING
+                or not owner
+                or owner == _cross_post_process_owner
+                or _is_cross_post_owner_alive(owner)
+            ):
+                continue
+
+            # patch_task 只更新仍存在的记录，扫描后被用户删除的任务不会被重建。
+            updated = sm.state.patch_task(
+                task_id,
+                state=const.TASK_STATE_FAILED,
+                failed_stage="interrupted",
+                error=_INTERRUPTED_TASK_ERROR,
+                task_owner=None,
+            )
+            if updated:
+                recovered += 1
+    except Exception as exc:
+        logger.exception(f"failed to recover interrupted tasks: {exc}")
+        return None
+
+    if recovered:
+        logger.warning(f"recovered interrupted video tasks: {recovered}")
+    return recovered
+
+
 def _run_cross_post(
     task_id: str,
     video_paths: tuple[str, ...],
@@ -1519,10 +1574,13 @@ def _run_pipeline(
     voxcpm_prompt_text: str = "",
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
+    # task_owner 记录执行流水线的进程，进程退出后启动恢复据此把遗留的
+    # processing 状态收敛为失败；排队中的任务尚无 owner，不会被误判。
     sm.state.update_task(
         task_id, state=const.TASK_STATE_PROCESSING, progress=5,
         failed_stage=None, error=None,
         videos=[], combined_videos=[], warnings=None, failed_video_index=None,
+        task_owner=_cross_post_process_owner,
     )
 
     if stop_at == "video" and params.subtitle_enabled:
