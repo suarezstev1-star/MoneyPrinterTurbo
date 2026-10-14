@@ -11,6 +11,32 @@ from app.config import config
 from app.services import kimi_code_oauth as oauth
 
 
+@pytest.fixture(autouse=True)
+def quiesced_config_queue():
+    """Start from an idle config writer.
+
+    ``oauth._set`` goes through ``update_config_nonblocking``: when another
+    thread (for example a deferred-flush worker leaked by an earlier test) still
+    holds the config lock, the write is only queued and the dict assertions
+    below observe stale values. Wait for the writer to go idle and drop updates
+    queued for dicts that no longer exist, so these tests do not depend on
+    which tests ran before them.
+    """
+    from app.config import config as config_module
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with config_module._pending_config_lock:
+            scheduled = config_module._pending_config_flush_scheduled
+        if not scheduled and config_module._config_save_lock.acquire(timeout=0.1):
+            config_module._config_save_lock.release()
+            break
+        time.sleep(0.05)
+    with config_module._pending_config_lock:
+        config_module._pending_config_updates.clear()
+    yield
+
+
 @pytest.fixture
 def isolated_credentials():
     app_config = {

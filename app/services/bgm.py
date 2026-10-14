@@ -142,6 +142,12 @@ def sanitize_upload_filename(filename: str) -> str:
     return safe_name
 
 
+_DECODE_ERROR_MARKERS = (
+    b"Decoder thread returned error",
+    b"Error processing packet in decoder",
+)
+
+
 def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
     """
     仅使用项目当前配置的 FFmpeg 验证文件包含可完整解码的音频流。
@@ -169,15 +175,17 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
                 file_path,
                 "-map",
                 "0:a:0",
-                # Normalize timestamps from decoded samples. A header-only
-                # WAV can exit successfully without producing any audio.
-                "-af",
-                "asetpts=N/SR/TB",
-                "-progress",
-                "pipe:1",
-                "-nostats",
+                # Emit the decoded samples as tiny mono PCM and require a
+                # non-empty stream. A header-only WAV can exit successfully
+                # without producing any audio. Counting output bytes is more
+                # reliable than ``-progress out_time_us``, which FFmpeg 6.1
+                # reports as 0 for clips shorter than a few hundred ms.
+                "-ac",
+                "1",
+                "-ar",
+                "4000",
                 "-f",
-                "null",
+                "s16le",
                 "-",
             ],
             capture_output=True,
@@ -190,14 +198,12 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
         raise BgmServiceError("failed to run FFmpeg for background music validation") from exc
     if decoded.returncode != 0:
         raise BgmUploadError("uploaded file must contain a decodable audio stream")
-    decoded_audio = False
-    for line in decoded.stdout.splitlines():
-        key, separator, value = line.partition(b"=")
-        if separator and key == b"out_time_us":
-            try:
-                decoded_audio = decoded_audio or int(value) > 0
-            except ValueError:
-                continue
+    # FFmpeg 6.1 can log "Decoder thread returned error" yet still exit 0 under
+    # -xerror (fixed in 7.0), so a damaged stream must also be caught on stderr.
+    stderr = getattr(decoded, "stderr", None) or b""
+    if any(marker in stderr for marker in _DECODE_ERROR_MARKERS):
+        raise BgmUploadError("uploaded file must contain a decodable audio stream")
+    decoded_audio = bool(decoded.stdout)
     if not decoded_audio:
         raise BgmUploadError("uploaded file must contain nonempty decodable audio")
 
