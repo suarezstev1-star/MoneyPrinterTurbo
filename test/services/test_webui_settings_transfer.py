@@ -313,10 +313,14 @@ def test_key_backup_companion_keys_stay_in_sync_with_the_provider_registry():
         provider.config_key(field.config_suffix)
         for provider in LLM_PROVIDER_REGISTRY
         for field in provider.extra_fields
+        # Read-only fields (e.g. the claude CLI path that gets executed) are
+        # config.toml-only and must never be restored from a backup file.
+        if not field.read_only
     }
 
     assert companion_app_keys == registry_extra_keys
     assert registry_extra_keys
+    assert "claude_code_cli_path" not in companion_app_keys
 
 
 def test_key_backup_skips_interface_preferences_section():
