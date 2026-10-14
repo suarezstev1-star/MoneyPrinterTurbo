@@ -1,6 +1,9 @@
+import difflib
 import json
 import os.path
+import re
 import tempfile
+import unicodedata
 import threading
 from timeit import default_timer as timer
 
@@ -227,108 +230,146 @@ def similarity(a, b):
     return 1 - (distance / max_length)
 
 
+_TOKEN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]|[^\W_]+"
+)
+_TIME_RE = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)")
+_MIN_CUE_SECONDS = 0.001
+
+
+def _tokenize(text):
+    """Words for alphabetic scripts, single characters for CJK; case/punctuation-free."""
+    return [t.lower() for t in _TOKEN_RE.findall(unicodedata.normalize("NFKC", text or ""))]
+
+
+def _token_weight(token):
+    return 3.0 if len(token) == 1 and ord(token) > 0x2E80 else max(len(token), 1)
+
+
+def _parse_srt_time(value):
+    match = _TIME_RE.search(value or "")
+    if not match:
+        return None
+    hours, minutes, seconds, fraction = match.groups()
+    millis = int((fraction + "000")[:3])
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + millis / 1000.0
+
+
+def _format_srt_time(seconds):
+    total_ms = int(round(max(seconds, 0.0) * 1000))
+    hours, rest = divmod(total_ms, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, millis = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def align_script_to_cues(script_lines, cues):
+    """
+    Assign a (start, end) in seconds to every script line, monotonically.
+
+    ``cues`` is a list of ``(start, end, text)``. Script and transcript words are
+    aligned with a longest-matching-blocks pass, so a cue that merged two script
+    lines (or a line split over cues) no longer shifts every later subtitle. Lines
+    without any matching word are spread proportionally over the audio that is
+    left between their matched neighbours. No returned span has zero duration.
+    """
+    script_tokens, token_line = [], []
+    for line_index, line in enumerate(script_lines):
+        for token in _tokenize(line):
+            script_tokens.append(token)
+            token_line.append(line_index)
+
+    # Every transcript token gets an interpolated time slice of its cue.
+    cue_tokens, cue_spans = [], []
+    for start, end, text in cues:
+        tokens = _tokenize(text)
+        if not tokens:
+            continue
+        step = (end - start) / len(tokens)
+        for position, token in enumerate(tokens):
+            cue_tokens.append(token)
+            cue_spans.append((start + step * position, start + step * (position + 1)))
+
+    audio_start = cues[0][0] if cues else 0.0
+    audio_end = max((c[1] for c in cues), default=audio_start)
+    spans = [None] * len(script_lines)
+
+    if script_tokens and cue_tokens:
+        matcher = difflib.SequenceMatcher(None, script_tokens, cue_tokens, autojunk=False)
+        for block in matcher.get_matching_blocks():
+            for offset in range(block.size):
+                line_index = token_line[block.a + offset]
+                start, end = cue_spans[block.b + offset]
+                current = spans[line_index]
+                spans[line_index] = (
+                    (start, end) if current is None
+                    else (min(current[0], start), max(current[1], end))
+                )
+
+    line_weight = [
+        sum(_token_weight(t) for t in _tokenize(line)) or 1.0 for line in script_lines
+    ]
+
+    result = []
+    cursor = audio_start
+    index = 0
+    while index < len(script_lines):
+        if spans[index] is not None:
+            start = max(spans[index][0], cursor)
+            end = max(spans[index][1], start + _MIN_CUE_SECONDS)
+            result.append((start, end))
+            cursor = end
+            index += 1
+            continue
+        # A run of unmatched lines: share the room before the next anchor.
+        run_end = index
+        while run_end < len(script_lines) and spans[run_end] is None:
+            run_end += 1
+        limit = spans[run_end][0] if run_end < len(script_lines) else audio_end
+        limit = max(limit, cursor + _MIN_CUE_SECONDS * (run_end - index))
+        total = sum(line_weight[index:run_end])
+        room = limit - cursor
+        for position in range(index, run_end):
+            share = room * line_weight[position] / total
+            start, end = cursor, cursor + max(share, _MIN_CUE_SECONDS)
+            result.append((start, end))
+            cursor = end
+        index = run_end
+    return result
+
+
 def correct(subtitle_file, video_script):
     subtitle_items = file_to_subtitles(subtitle_file)
     normalized_script = utils.normalize_script_for_subtitle_matching(video_script)
-    script_lines = utils.split_string_by_punctuations(normalized_script)
+    script_lines = [
+        line.strip()
+        for line in utils.split_string_by_punctuations(normalized_script)
+        if line.strip()
+    ]
+    if not script_lines or not subtitle_items:
+        logger.warning("nothing to correct: empty script or transcription")
+        return
 
-    corrected = False
-    new_subtitle_items = []
-    script_index = 0
-    subtitle_index = 0
+    cues = []
+    for _index, timing, text in subtitle_items:
+        parts = re.split(r"\s*-->\s*", timing)
+        start = _parse_srt_time(parts[0]) if parts else None
+        end = _parse_srt_time(parts[1]) if len(parts) > 1 else None
+        if start is None or end is None:
+            continue
+        cues.append((start, max(end, start), text))
 
-    while script_index < len(script_lines) and subtitle_index < len(subtitle_items):
-        script_line = script_lines[script_index].strip()
-        subtitle_line = subtitle_items[subtitle_index][2].strip()
-
-        if script_line == subtitle_line:
-            new_subtitle_items.append(subtitle_items[subtitle_index])
-            script_index += 1
-            subtitle_index += 1
-        else:
-            combined_subtitle = subtitle_line
-            start_time = subtitle_items[subtitle_index][1].split(" --> ")[0]
-            end_time = subtitle_items[subtitle_index][1].split(" --> ")[1]
-            next_subtitle_index = subtitle_index + 1
-
-            while next_subtitle_index < len(subtitle_items):
-                next_subtitle = subtitle_items[next_subtitle_index][2].strip()
-                if similarity(
-                    script_line, combined_subtitle + " " + next_subtitle
-                ) > similarity(script_line, combined_subtitle):
-                    combined_subtitle += " " + next_subtitle
-                    end_time = subtitle_items[next_subtitle_index][1].split(" --> ")[1]
-                    next_subtitle_index += 1
-                else:
-                    break
-
-            if similarity(script_line, combined_subtitle) > 0.8:
-                logger.warning(
-                    f"Merged/Corrected - Script: {script_line}, Subtitle: {combined_subtitle}"
-                )
-                new_subtitle_items.append(
-                    (
-                        len(new_subtitle_items) + 1,
-                        f"{start_time} --> {end_time}",
-                        script_line,
-                    )
-                )
-                corrected = True
-            else:
-                logger.warning(
-                    f"Mismatch - Script: {script_line}, Subtitle: {combined_subtitle}"
-                )
-                new_subtitle_items.append(
-                    (
-                        len(new_subtitle_items) + 1,
-                        f"{start_time} --> {end_time}",
-                        script_line,
-                    )
-                )
-                corrected = True
-
-            script_index += 1
-            subtitle_index = next_subtitle_index
-
-    # Process the remaining lines of the script.
-    while script_index < len(script_lines):
-        logger.warning(f"Extra script line: {script_lines[script_index]}")
-        if subtitle_index < len(subtitle_items):
-            new_subtitle_items.append(
-                (
-                    len(new_subtitle_items) + 1,
-                    subtitle_items[subtitle_index][1],
-                    script_lines[script_index],
-                )
-            )
-            subtitle_index += 1
-        else:
-            new_subtitle_items.append(
-                (
-                    len(new_subtitle_items) + 1,
-                    "00:00:00,000 --> 00:00:00,000",
-                    script_lines[script_index],
-                )
-            )
-        script_index += 1
-        corrected = True
-
-    if subtitle_index < len(subtitle_items):
-        logger.warning(
-            f"Dropping {len(subtitle_items) - subtitle_index} transcription cue(s) "
-            "after the script ends"
-        )
-        corrected = True
-
-    if corrected:
-        content = "".join(
-            f"{i + 1}\n{item[1]}\n{item[2]}\n\n"
-            for i, item in enumerate(new_subtitle_items)
-        )
-        write_subtitle_file(subtitle_file, content)
-        logger.info("Subtitle corrected")
-    else:
+    if [c[2].strip() for c in cues] == script_lines:
         logger.success("Subtitle is correct")
+        return
+
+    spans = align_script_to_cues(script_lines, cues)
+    content = "".join(
+        f"{i + 1}\n{_format_srt_time(start)} --> {_format_srt_time(end)}\n{line}\n\n"
+        for i, (line, (start, end)) in enumerate(zip(script_lines, spans))
+    )
+    write_subtitle_file(subtitle_file, content)
+    logger.info("Subtitle corrected")
 
 
 if __name__ == "__main__":
