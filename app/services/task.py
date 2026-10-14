@@ -1000,7 +1000,11 @@ def generate_final_videos(
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
     # Matching preserves keyword order; batch allocation varies each keyword's candidates.
-    if params.match_materials_to_script:
+    # Sentence-aligned footage is already in narrative order, so shuffling it
+    # again at render time would undo the alignment.
+    if params.match_materials_to_script or (
+        params.video_count == 1 and task_artifacts.has_sentence_alignment(task_id)
+    ):
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
