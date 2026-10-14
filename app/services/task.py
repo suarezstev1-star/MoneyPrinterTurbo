@@ -640,16 +640,24 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
-def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
+def generate_subtitle(task_id, params, video_script, sub_maker, audio_file, warnings=None):
     """
     Generate subtitle for the video script.
     If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
     Otherwise, it will generate the subtitle using the specified provider.
+    When ``warnings`` is a list, user-visible entries are appended to it:
+    ``subtitles_skipped`` (requested but none produced) and ``subtitles_partial``
+    (some script lines could not be timed).
     Returns:
         - subtitle_path: path to the generated subtitle file
     """
     logger.info("\n\n## generating subtitle")
     if not params.subtitle_enabled:
+        return ""
+
+    def _skipped(reason):
+        if warnings is not None:
+            warnings.append({"code": "subtitles_skipped", "reason": reason})
         return ""
 
     final_subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
@@ -668,20 +676,22 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             "subtitle maker is missing, skip subtitle generation for provider: "
             f"{subtitle_provider}"
         )
-        return ""
+        return _skipped("no_timing_source")
 
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
 
     # A failed retry must never reuse captions from an earlier narration.
     with staged_subtitle_file(final_subtitle_path) as subtitle_path:
         if subtitle_provider == "edge":
-            voice.create_subtitle(
+            outcome = voice.create_subtitle(
                 text=video_script,
                 sub_maker=sub_maker,
                 subtitle_file=subtitle_path,
                 word_level=is_word_level,
             )
-            if not os.path.exists(subtitle_path):
+            # The staged file is created empty by mkstemp, so existence says
+            # nothing; only parseable cues count as produced subtitles.
+            if not subtitle.file_to_subtitles(subtitle_path):
                 # Edge 字幕偶尔会因为时间轴与文案无法匹配而没有产出文件。这里不能
                 # 自动切换到 Whisper，否则首次失败会在用户不知情的情况下下载数 GB
                 # 的模型。只有显式配置 Whisper 时才允许加载模型，Edge 失败则保留
@@ -690,7 +700,17 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                     "edge subtitle generation did not produce a subtitle file; "
                     "skip subtitles without falling back to whisper"
                 )
-                return ""
+                return _skipped("no_matching_lines")
+            if (
+                isinstance(outcome, dict)
+                and warnings is not None
+                and outcome.get("matched", 0) < outcome.get("total", 0)
+            ):
+                warnings.append({
+                    "code": "subtitles_partial",
+                    "matched": outcome["matched"],
+                    "total": outcome["total"],
+                })
 
         if subtitle_provider == "whisper":
             subtitle.create(
@@ -700,7 +720,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             )
             if not subtitle.file_to_subtitles(subtitle_path):
                 logger.warning("whisper produced no usable subtitle cues")
-                return ""
+                return _skipped("no_transcription")
             if not is_word_level:
                 logger.info("\n\n## correcting subtitle")
                 subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
@@ -708,7 +728,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
         if not subtitle_lines:
             logger.warning(f"subtitle file is invalid: {subtitle_path}")
-            return ""
+            return _skipped("invalid_subtitle_file")
 
         os.replace(subtitle_path, final_subtitle_path)
         return final_subtitle_path
@@ -1748,8 +1768,10 @@ def _run_pipeline(
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
+    subtitle_warnings = []
     subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
+        task_id, params, video_script, sub_maker, audio_file,
+        warnings=subtitle_warnings,
     )
 
     if stop_at == "subtitle":
@@ -1764,8 +1786,12 @@ def _run_pipeline(
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             subtitle_path=subtitle_path,
+            warnings=subtitle_warnings or None,
         )
-        return {"subtitle_path": subtitle_path}
+        stage_result = {"subtitle_path": subtitle_path}
+        if subtitle_warnings:
+            stage_result["warnings"] = subtitle_warnings
+        return stage_result
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
@@ -1864,7 +1890,7 @@ def _run_pipeline(
         "cross_post_results": None,
         "cross_post_error": None,
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
-        "warnings": generation_warnings or None,
+        "warnings": (subtitle_warnings + list(generation_warnings or [])) or None,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs

@@ -387,7 +387,8 @@ class TestSubtitleService(unittest.TestCase):
             [item[2] for item in items],
             ["Expected sentence", "Extra sentence"],
         )
-        self.assertEqual(items[1][1], "00:00:00,000 --> 00:00:00,000")
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", [item[1] for item in items])
+        self.assertNotEqual(*items[1][1].split(" --> "))
 
     def test_file_to_subtitles_keeps_last_block_without_trailing_newline(self):
         """
