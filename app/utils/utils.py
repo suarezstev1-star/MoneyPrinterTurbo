@@ -543,3 +543,74 @@ def load_locales(i18n_dir):
 
 def parse_extension(filename):
     return Path(filename).suffix.lower().lstrip('.')
+
+
+_URL_PATTERN = re.compile(
+    r"(?P<scheme>https?)://(?P<authority>[^\s'\"<>/?#]+)[^\s'\"<>]*", re.I
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<name>(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|"
+    r"authorization|x-api-key|key)['\"]?\s*[=:]\s*)(?:bearer\s+)?[^\s,;&'\"]+",
+    re.I,
+)
+_BEARER_PATTERN = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
+_KEY_LIKE_PATTERN = re.compile(r"\b(?:sk|pk|rk|AIza|xox[abp])[-_A-Za-z0-9]{16,}")
+_SECRET_CONFIG_NAME = re.compile(r"(key|token|secret|password)", re.I)
+_MIN_SECRET_LENGTH = 6
+
+
+def _configured_secret_values() -> list[str]:
+    """Collect credential-like values from [app] and proxy settings."""
+    from urllib.parse import quote_plus
+
+    from app.config import config
+
+    candidates: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    for section, is_proxy in ((config.app, False), (config.proxy, True)):
+        if not isinstance(section, dict):
+            continue
+        for name, value in section.items():
+            if is_proxy or _SECRET_CONFIG_NAME.search(str(name)):
+                collect(value)
+
+    secrets: list[str] = []
+    for value in candidates:
+        value = value.strip()
+        if len(value) < _MIN_SECRET_LENGTH:
+            continue
+        secrets.append(value)
+        encoded = quote_plus(value)
+        if encoded != value:
+            secrets.append(encoded)
+    # Replace longer values first so a secret containing another is fully hidden.
+    return sorted(set(secrets), key=len, reverse=True)
+
+
+def redact_sensitive_text(message: Any, *secrets: str) -> str:
+    """Remove credentials and URL details from text returned to API callers.
+
+    Provider exceptions can echo full request URLs (with query-string keys),
+    bearer tokens or configured credentials. Callers keep the host for
+    troubleshooting, but never paths, queries, userinfo or secret values.
+    """
+    text = str(message)
+    for secret in (*secrets, *_configured_secret_values()):
+        if secret:
+            text = text.replace(str(secret), "***")
+
+    def _url(match: re.Match) -> str:
+        authority = match.group("authority").rsplit("@", 1)[-1]
+        return f"{match.group('scheme')}://{authority}/..."
+
+    text = _URL_PATTERN.sub(_url, text)
+    text = _BEARER_PATTERN.sub("Bearer ***", text)
+    text = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(lambda m: f"{m.group('name')}***", text)
+    return _KEY_LIKE_PATTERN.sub("***", text)

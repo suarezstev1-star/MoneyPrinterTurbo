@@ -105,11 +105,63 @@ def _resolve_path_within_directory(base_dir: str, unsafe_path: str, request_id: 
         )
 
 
+_ERROR_TEXT_KEYS = frozenset({"error", "message", "detail", "reason", "warning"})
+
+
+def _redact_error_fields(value, key=None):
+    """Redact provider error text (URLs, keys) from API-visible task fields."""
+    if isinstance(value, str):
+        return utils.redact_sensitive_text(value) if key in _ERROR_TEXT_KEYS else value
+    if isinstance(value, list):
+        return [_redact_error_fields(item, key) for item in value]
+    if isinstance(value, dict):
+        return {k: _redact_error_fields(v, k) for k, v in value.items()}
+    return value
+
+
 def _public_task_data(task: dict) -> dict:
     """复制任务状态并移除仅用于服务端进程协调的内部字段。"""
     public_task = dict(task)
     public_task.pop("cross_post_owner", None)
+    public_task.pop("owner", None)
+    for key in ("error", "cross_post_error"):
+        if isinstance(public_task.get(key), str):
+            public_task[key] = utils.redact_sensitive_text(public_task[key])
+    for key in ("cross_post_results", "warnings"):
+        if key in public_task:
+            public_task[key] = _redact_error_fields(public_task[key], key)
     return public_task
+
+
+def _task_visible_to_caller(task: dict | None) -> bool:
+    """With an API key configured, hide tasks stamped by a different key.
+
+    Tasks without an owner stamp (created before this field existed or by the
+    WebUI/CLI) stay visible, preserving single-tenant behavior.
+    """
+    if not task:
+        return False
+    fingerprint = base.owner_fingerprint()
+    if fingerprint is None:
+        return True
+    owner = task.get("owner")
+    return owner in (None, "") or owner == fingerprint
+
+
+def _list_visible_tasks(page: int, page_size: int) -> tuple[list[dict], int]:
+    if base.owner_fingerprint() is None:
+        return sm.state.get_all_tasks(page, page_size)
+    visible: list[dict] = []
+    batch_size = 200
+    current = 1
+    while True:
+        batch, total = sm.state.get_all_tasks(current, batch_size)
+        visible.extend(task for task in batch if _task_visible_to_caller(task))
+        if current * batch_size >= total or not batch:
+            break
+        current += 1
+    start = (page - 1) * page_size
+    return visible[start : start + page_size], len(visible)
 
 
 def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) -> str:
@@ -254,7 +306,11 @@ def create_task(
             "request_id": request_id,
             "params": body.model_dump(),
         }
-        sm.state.update_task(task_id)
+        owner = base.owner_fingerprint()
+        if owner:
+            sm.state.update_task(task_id, owner=owner)
+        else:
+            sm.state.update_task(task_id)
         try:
             task_manager.add_task(
                 tm.start, task_id=task_id, params=body, stop_at=stop_at
@@ -285,7 +341,7 @@ def get_all_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=1000),
 ):
-    tasks, total = sm.state.get_all_tasks(page, page_size)
+    tasks, total = _list_visible_tasks(page, page_size)
     request_id = base.get_task_id(request)
     endpoint = config.app.get("endpoint", "").rstrip("/")
     task_dir = utils.task_dir()
@@ -313,7 +369,7 @@ def get_task(
     request_id = base.get_task_id(request)
     endpoint = config.app.get("endpoint", "").rstrip("/")
     task = sm.state.get_task(task_id)
-    if task:
+    if task and _task_visible_to_caller(task):
         task_dir = utils.task_dir()
         response_task = _task_response_data(task, endpoint, task_dir, request_id)
         return utils.get_response(200, response_task)
@@ -331,7 +387,7 @@ def get_task(
 def delete_video(request: Request, task_id: str = Path(..., description="Task ID")):
     request_id = base.get_task_id(request)
     task = sm.state.get_task(task_id)
-    if task:
+    if task and _task_visible_to_caller(task):
         if tm.is_task_busy(task):
             logger.warning(
                 f"refuse to delete busy task, request_id: {request_id}, "
