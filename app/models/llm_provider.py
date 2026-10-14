@@ -13,6 +13,9 @@ class LLMProviderField:
     required: bool = False
     secret: bool = False
     default_value: str = ""
+    # Read-only fields are shown in the WebUI but can only be changed in
+    # config.toml (for example, a setting that selects an executable to run).
+    read_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,7 +530,7 @@ LLM_PROVIDER_REGISTRY = (
         show_base_url=False,
         requires_model_name=False,
         extra_fields=(
-            LLMProviderField("cli_path", "Claude CLI Path"),
+            LLMProviderField("cli_path", "Claude CLI Path", read_only=True),
             LLMProviderField("timeout", "Timeout (seconds)", default_value="300"),
         ),
     ),
