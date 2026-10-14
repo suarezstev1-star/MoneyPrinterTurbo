@@ -1707,6 +1707,39 @@ class TestTaskService(unittest.TestCase):
         )
         self.assertEqual(published_task["cross_post_error"], "upload failed")
 
+    def test_start_skips_cross_post_without_explicit_opt_in(self):
+        """API 请求默认 cross_post=False：即使配置了自动发布也不得发布。"""
+        params = VideoParams(video_subject="Coffee", cross_post=False)
+        service = tm.upload_post.upload_post_service
+        state = MemoryState()
+
+        with (
+            patch.object(tm, "generate_script", return_value="generated script"),
+            patch.object(tm, "generate_terms", return_value=["coffee"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm, "generate_audio", return_value=("audio.mp3", 5, object())
+            ),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
+            patch.object(
+                tm,
+                "generate_final_videos",
+                return_value=(["final-1.mp4"], ["combined-1.mp4"], []),
+            ),
+            patch.object(service, "is_configured", return_value=True),
+            patch.object(type(service), "auto_upload", new_callable=PropertyMock, return_value=True),
+            patch.object(type(service), "platforms", new_callable=PropertyMock, return_value=["youtube"]),
+            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.sm, "state", state),
+            patch.object(tm._cross_post_executor, "submit") as submit,
+        ):
+            result = tm.start("no-cross-post", params)
+
+        cross_post.assert_not_called()
+        submit.assert_not_called()
+        self.assertIsNone(result["cross_post_state"])
+
     def test_start_returns_before_cross_post_worker_runs(self):
         """视频任务完成时只提交发布工作，不能在生成线程中同步上传。"""
         params = VideoParams(video_subject="Coffee")

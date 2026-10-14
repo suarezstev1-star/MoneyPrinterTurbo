@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from app.config import config
 from app.utils import file_security, utils
 
 
@@ -296,6 +297,27 @@ def validate_bgm_upload(filename: str, source: BinaryIO) -> str:
         _remove_staged_file(temp_path)
 
 
+def _config_number(name: str, default: float) -> float:
+    value = config.app.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(value, 0)
+
+
+def _prune_uploaded_bgm(target_dir: str) -> None:
+    """Apply the retention/quota policy to user-uploaded background music."""
+    removed = file_security.prune_upload_directory(
+        target_dir,
+        max_age_seconds=_config_number("upload_retention_days", 30) * 86400,
+        max_total_bytes=int(_config_number("bgm_upload_quota_mb", 1024) * 1024 * 1024),
+        suffixes=tuple(SUPPORTED_BGM_EXTENSIONS),
+        name_pattern=file_security.UPLOADED_FILE_NAME_PATTERN,
+        protected_prefix=_INTERNAL_UPLOAD_PREFIX[:1],
+    )
+    if removed:
+        logger.info(f"pruned {len(removed)} old background music upload(s)")
+
+
 def save_bgm_upload(filename: str, source: BinaryIO) -> str:
     """
     以分块、限量和原子替换的方式保存用户背景音乐。
@@ -311,6 +333,7 @@ def save_bgm_upload(filename: str, source: BinaryIO) -> str:
 
     try:
         _validate_audio(temp_path)
+        _prune_uploaded_bgm(os.path.dirname(temp_path))
         try:
             os.replace(temp_path, target_path)
         except OSError as exc:

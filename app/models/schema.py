@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.config import config
 
@@ -88,6 +88,16 @@ class MaterialInfo:
     source_info: Optional[dict[str, Any]] = None
 
 
+_MAX_SUBJECT_CHARS = 500
+_MAX_SCRIPT_CHARS = 20000
+_MAX_TERM_ITEMS = 50
+_MAX_TERM_CHARS = 200
+_MAX_TERMS_STRING_CHARS = 5000
+_MAX_AUDIO_FACTOR = 10.0
+_MAX_FONT_SIZE = 400
+_MAX_STROKE_WIDTH = 50.0
+
+
 class VideoParams(BaseModel):
     """
     {
@@ -103,17 +113,23 @@ class VideoParams(BaseModel):
     }
     """
 
-    video_subject: str
-    video_script: str = ""  # Script used to generate the video
-    video_terms: Optional[str | List[str]] = None  # Keywords used to generate the video
+    video_subject: str = Field(max_length=_MAX_SUBJECT_CHARS)
+    # Script used to generate the video
+    video_script: str = Field(default="", max_length=_MAX_SCRIPT_CHARS)
+    # Keywords used to generate the video
+    video_terms: Optional[str | List[str]] = None
+    # Cross-posting to the owner's social accounts. API requests must opt in
+    # explicitly (see TaskVideoRequest); WebUI and CLI keep the configured
+    # auto-upload behavior.
+    cross_post: bool = True
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
-    video_clip_duration: int = Field(default=5, ge=1)
+    video_clip_duration: int = Field(default=5, ge=1, le=300)
     video_clip_speed: Optional[float] = 1.0
     match_materials_to_script: bool = False
-    video_count: int = Field(default=1, ge=1)
+    video_count: int = Field(default=1, ge=1, le=50)
 
     video_source: Optional[str] = "pexels"
     video_materials: Optional[List[MaterialInfo]] = (
@@ -126,11 +142,11 @@ class VideoParams(BaseModel):
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
-    voice_volume: Optional[float] = Field(default=1.0, allow_inf_nan=False)
-    voice_rate: Optional[float] = Field(default=1.0, allow_inf_nan=False)
+    voice_volume: Optional[float] = Field(default=1.0, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
+    voice_rate: Optional[float] = Field(default=1.0, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = Field(default=0.2, allow_inf_nan=False)
+    bgm_volume: Optional[float] = Field(default=0.2, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     # Lower the music while the narration speaks.
     bgm_ducking: bool = True
     # 视频配乐供应商共用提示词，WebUI 新任务统一写入该字段。保留下面的
@@ -156,24 +172,43 @@ class VideoParams(BaseModel):
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
 
-    font_size: int = Field(default=60, ge=1)
+    font_size: int = Field(default=60, ge=1, le=_MAX_FONT_SIZE)
     stroke_color: Optional[str] = "#000000"
-    stroke_width: float = Field(default=3.0, ge=0, allow_inf_nan=False)
-    n_threads: Optional[int] = 2
+    stroke_width: float = Field(default=3.0, ge=0, le=_MAX_STROKE_WIDTH, allow_inf_nan=False)
+    n_threads: Optional[int] = Field(default=2, ge=1, le=64)
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
 
+    @field_validator("video_terms")
+    @classmethod
+    def _bound_video_terms(cls, value):
+        if isinstance(value, str):
+            if len(value) > _MAX_TERMS_STRING_CHARS:
+                raise ValueError(
+                    f"video_terms must be at most {_MAX_TERMS_STRING_CHARS} characters"
+                )
+        elif isinstance(value, list):
+            if len(value) > _MAX_TERM_ITEMS:
+                raise ValueError(
+                    f"video_terms must contain at most {_MAX_TERM_ITEMS} items"
+                )
+            if any(len(item) > _MAX_TERM_CHARS for item in value):
+                raise ValueError(
+                    f"each video term must be at most {_MAX_TERM_CHARS} characters"
+                )
+        return value
+
 
 class SubtitleRequest(BaseModel):
-    video_script: str
+    video_script: str = Field(max_length=_MAX_SCRIPT_CHARS)
     video_language: Optional[str] = ""
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
-    voice_volume: Optional[float] = Field(default=1.0, allow_inf_nan=False)
-    voice_rate: Optional[float] = Field(default=1.2, allow_inf_nan=False)
+    voice_volume: Optional[float] = Field(default=1.0, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
+    voice_rate: Optional[float] = Field(default=1.2, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = Field(default=0.2, allow_inf_nan=False)
+    bgm_volume: Optional[float] = Field(default=0.2, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     subtitle_position: Optional[str] = config.ui.get("subtitle_position", "bottom")
     subtitle_display_mode: SubtitleDisplayMode = _get_valid_ui_choice(
         "subtitle_display_mode", _SUBTITLE_DISPLAY_MODES, "sentence"
@@ -185,22 +220,22 @@ class SubtitleRequest(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
-    font_size: int = Field(default=60, ge=1)
+    font_size: int = Field(default=60, ge=1, le=_MAX_FONT_SIZE)
     stroke_color: Optional[str] = "#000000"
-    stroke_width: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    stroke_width: float = Field(default=3.0, ge=0, le=_MAX_STROKE_WIDTH, allow_inf_nan=False)
     video_source: Optional[str] = "local"
     subtitle_enabled: Optional[bool] = True
 
 
 class AudioRequest(BaseModel):
-    video_script: str
+    video_script: str = Field(max_length=_MAX_SCRIPT_CHARS)
     video_language: Optional[str] = ""
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
-    voice_volume: Optional[float] = Field(default=1.0, allow_inf_nan=False)
-    voice_rate: Optional[float] = Field(default=1.2, allow_inf_nan=False)
+    voice_volume: Optional[float] = Field(default=1.0, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
+    voice_rate: Optional[float] = Field(default=1.2, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = Field(default=0.2, allow_inf_nan=False)
+    bgm_volume: Optional[float] = Field(default=0.2, ge=0, le=_MAX_AUDIO_FACTOR, allow_inf_nan=False)
     video_source: Optional[str] = "local"
 
 
@@ -215,7 +250,7 @@ class VideoScriptParams:
     }
     """
 
-    video_subject: Optional[str] = "春天的花海"
+    video_subject: Optional[str] = Field(default="春天的花海", max_length=_MAX_SUBJECT_CHARS)
     video_language: Optional[str] = ""
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
@@ -232,9 +267,9 @@ class VideoTermsParams:
     }
     """
 
-    video_subject: Optional[str] = "春天的花海"
-    video_script: Optional[str] = (
-        "春天的花海，如诗如画般展现在眼前。万物复苏的季节里，大地披上了一袭绚丽多彩的盛装。金黄的迎春、粉嫩的樱花、洁白的梨花、艳丽的郁金香……"
+    video_subject: Optional[str] = Field(default="春天的花海", max_length=_MAX_SUBJECT_CHARS)
+    video_script: Optional[str] = Field(default=
+        "春天的花海，如诗如画般展现在眼前。万物复苏的季节里，大地披上了一袭绚丽多彩的盛装。金黄的迎春、粉嫩的樱花、洁白的梨花、艳丽的郁金香……", max_length=_MAX_SCRIPT_CHARS
     )
     amount: Optional[int] = 5
     match_materials_to_script: bool = False
@@ -262,6 +297,9 @@ class TaskVideoRequest(VideoParams, BaseModel):
     video_count: int = Field(default=1, ge=1, le=5)
     video_clip_duration: int = Field(default=5, ge=1, le=15)
     n_threads: Optional[int] = Field(default=2, ge=1, le=16)
+    # Publishing to the owner's social accounts from an API call is an
+    # explicit per-request opt-in, even when auto-upload is configured.
+    cross_post: bool = False
 
 
 class TaskQueryRequest(BaseModel):

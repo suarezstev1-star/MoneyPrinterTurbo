@@ -1,5 +1,7 @@
 import pytest
 
+from app.controllers import rate_limit
+
 
 @pytest.fixture(autouse=True)
 def _webui_allow_unauthenticated(monkeypatch):
@@ -11,3 +13,11 @@ def _webui_allow_unauthenticated(monkeypatch):
     """
     monkeypatch.setenv("MPT_WEBUI_ALLOW_UNAUTHENTICATED", "1")
     monkeypatch.delenv("MPT_WEBUI_PASSWORD", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_api_rate_limits():
+    """In-process limiter state must not leak between tests."""
+    rate_limit.reset_all()
+    yield
+    rate_limit.reset_all()
