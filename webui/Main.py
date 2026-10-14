@@ -67,6 +67,7 @@ from app.services import task as tm
 from app.services import version_checker
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
+from webui import access_gate
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -264,6 +265,9 @@ CREDENTIAL_KEY_SUFFIXES = (
     "api_key",
     "api_keys",
     "api_token",
+    # OAuth 登录写入的 kimi_code_access_token / kimi_code_refresh_token 等。
+    "access_token",
+    "refresh_token",
     "access_key",
     "secret_key",
     "speech_key",
@@ -280,6 +284,9 @@ CREDENTIAL_COMPANION_KEYS = {
         provider.config_key(field.config_suffix)
         for provider in LLM_PROVIDER_REGISTRY
         for field in provider.extra_fields
+        # 只读字段（例如会被执行的 CLI 路径）只能在 config.toml 中修改，
+        # 不能通过备份导入改写。
+        if not field.read_only
     ),
 }
 
@@ -1705,6 +1712,45 @@ def _dismiss_settings_dialog():
     st.session_state["settings_dialog_open"] = False
 
 
+def _webui_session_id():
+    """每个浏览器会话一个稳定 ID，用于限制该会话的排队任务数。"""
+    session_id = st.session_state.get("webui_session_id")
+    if not session_id:
+        session_id = uuid4().hex
+        st.session_state["webui_session_id"] = session_id
+    return session_id
+
+
+def _access_mode():
+    return access_gate.access_mode(config.app, st.get_option)
+
+
+def _sensitive_features_enabled():
+    """设置编辑、密钥导出/导入和服务商登录是否可用。"""
+    return access_gate.sensitive_features_enabled(_access_mode())
+
+
+def _render_access_gate():
+    """需要密码时只渲染密码输入框；返回 True 表示可以继续渲染页面。"""
+    if _access_mode() != access_gate.MODE_GATED:
+        return True
+    if st.session_state.get(access_gate.AUTH_SESSION_KEY):
+        return True
+    expected = access_gate.configured_password(config.app)
+    st.info(tr("Access Password Prompt"))
+    with st.form("webui_access_form"):
+        candidate = st.text_input(tr("Access Password"), type="password")
+        submitted = st.form_submit_button(tr("Unlock"))
+    if submitted:
+        if access_gate.verify_password(candidate, expected):
+            st.session_state[access_gate.AUTH_SESSION_KEY] = True
+            st.rerun()
+        # 简单的失败延迟，降低在线猜测密码的速度。
+        time.sleep(1)
+        st.error(tr("Access Password Incorrect"))
+    return False
+
+
 def _open_settings_dialog(target_tab=None):
     """打开设置弹窗，并可直接定位到指定业务标签页。"""
     st.session_state["settings_dialog_open"] = True
@@ -1799,6 +1845,7 @@ def _render_top_bar():
                 icon=":material/settings:",
                 width="content",
                 on_click=_open_settings_dialog,
+                disabled=not _sensitive_features_enabled(),
             )
 
             language_codes = list(locales.keys())
@@ -3109,6 +3156,9 @@ def _render_settings_transfer(params):
 def _render_key_backup_settings(panel):
     """渲染密钥备份的导出与恢复入口。"""
     with panel:
+        if not _sensitive_features_enabled():
+            st.warning(tr("Settings Locked"))
+            return
         backup_message = st.session_state.pop("key_backup_message", None)
         if backup_message:
             message_type, message = backup_message
@@ -3188,9 +3238,9 @@ def _render_key_backup_settings(panel):
 )
 def _render_settings_dialog():
     with st.container():
-        # 历史 hide_config 只用于隐藏旧基础设置面板。改为固定设置入口后，该值
-        # 不再有用户可见意义，统一迁移为 false，避免旧配置影响后续版本。
-        _set_runtime_config("app", "hide_config", False)
+        if not _sensitive_features_enabled():
+            st.warning(tr("Settings Locked"))
+            return
         settings_tab_labels = [
             tr("LLM Settings Tab"),
             tr("Material API Tab"),
@@ -3570,7 +3620,12 @@ def _render_settings_dialog():
                     value=(config.app.get(field_config_key, "") or field.default_value),
                     type="password" if field.secret else "default",
                     key=f"{llm_provider}_{field.config_suffix}_input",
+                    disabled=field.read_only,
+                    help=tr("Read Only In WebUI") if field.read_only else None,
                 )
+                if field.read_only:
+                    # 该值会决定执行哪个程序，只允许在 config.toml 中修改。
+                    continue
                 _set_runtime_config(
                     "app",
                     field_config_key,
@@ -3580,7 +3635,11 @@ def _render_settings_dialog():
                     ),
                 )
 
-            if llm_provider == "kimi_code" and middle_config_panel.open:
+            if (
+                llm_provider == "kimi_code"
+                and middle_config_panel.open
+                and _sensitive_features_enabled()
+            ):
                 from app.services import kimi_code_oauth
                 from webui.kimi_login import render_kimi_login
 
@@ -8353,6 +8412,7 @@ def _render_generation_controls(
                 voxcpm_reference_audio=voxcpm_reference_audio,
                 voxcpm_prompt_audio=voxcpm_prompt_audio,
                 voxcpm_prompt_text=voxcpm_prompt_text,
+                session_id=_webui_session_id(),
             )
             if loomloom_video_request is not None:
                 # 一个报价只允许提交一次。后台请求自带稳定幂等 ID；提交成功后
@@ -8361,6 +8421,12 @@ def _render_generation_controls(
                 st.session_state["loomloom_video_quote"] = None
                 st.session_state["loomloom_video_input_signature"] = ""
                 st.session_state["loomloom_video_client_request_id"] = ""
+        except webui_task.SessionTaskLimitError as limit_error:
+            _remove_active_generation_task(task_id)
+            st.warning(
+                tr("Session Task Limit Reached").format(limit=limit_error.limit)
+            )
+            st.stop()
         except Exception:
             _remove_active_generation_task(task_id)
             st.error(tr("Video Generation Failed"))
@@ -8375,6 +8441,12 @@ def _render_generation_controls(
 
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
+    if not _render_access_gate():
+        st.stop()
+    if _access_mode() == access_gate.MODE_RESTRICTED:
+        st.warning(tr("Unauthenticated Banner"))
+        # 关闭此前可能打开的设置弹窗状态。
+        st.session_state["settings_dialog_open"] = False
     _render_top_bar()
 
     if st.session_state.get("settings_dialog_open", False):

@@ -22,6 +22,15 @@ PROVIDER_TIPS_PREFIXES = (
 # 避免把完全相同的品牌名复制十份，也避免长说明后续只更新部分语言。
 ENGLISH_FALLBACK_KEYS = frozenset(
     {
+        # WebUI 访问保护与只读字段提示只维护中英文。
+        "Access Password",
+        "Access Password Incorrect",
+        "Access Password Prompt",
+        "Unlock",
+        "Settings Locked",
+        "Read Only In WebUI",
+        "Unauthenticated Banner",
+        "Session Task Limit Reached",
         "AI Video Quote Required",
         "AI Video Quote Retained For Retry",
         "AI Video Quote Estimate Incomplete",

@@ -37,9 +37,12 @@ api_key = ""
 # General / 通用设置
 # -----------------------------------------------------------------------------
 
-# Hide the basic configuration panel in the WebUI.
-# 是否隐藏 WebUI 基础配置面板。
-hide_config = false
+# Optional WebUI access password (or set the MPT_WEBUI_PASSWORD environment
+# variable). When set, the WebUI shows only a password prompt until it is
+# entered. Without it, a WebUI reachable from other hosts disables the settings
+# editor and key export/import.
+# WebUI 访问密码（也可用环境变量 MPT_WEBUI_PASSWORD）。设置后需先输入密码。
+webui_password = ""
 
 # Script generation backend. "local" keeps the existing LLM workflow.
 # "loomloom" uses a configured LoomLoom Market SkillBot to return multiple

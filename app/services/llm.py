@@ -122,6 +122,41 @@ def _is_conflicting_claude_code_env(name: str) -> bool:
     return name.startswith("CLAUDE_CODE_SKIP_") and name.endswith("_AUTH")
 
 
+# The claude_code adapter executes whatever path is configured, so only the
+# official CLI executable names are accepted.
+CLAUDE_CLI_ALLOWED_BASENAMES = frozenset({"claude", "claude.cmd", "claude.exe"})
+
+
+def _claude_cli_basename(path: str) -> str:
+    return re.split(r"[\\/]", str(path).strip())[-1].lower()
+
+
+def resolve_claude_cli_path(
+    configured, config_key: str = "claude_code_cli_path", label: str = "claude_code"
+) -> str:
+    """Resolve the claude CLI executable, rejecting any other program."""
+    configured_cli = (configured or "").strip() or "claude"
+    if _claude_cli_basename(configured_cli) not in CLAUDE_CLI_ALLOWED_BASENAMES:
+        raise ValueError(
+            f"{label}: {config_key} must point to the claude CLI executable "
+            f"(claude, claude.cmd or claude.exe); got '{configured_cli}'."
+        )
+    cli_path = shutil.which(configured_cli)
+    if not cli_path and os.path.isfile(configured_cli):
+        cli_path = configured_cli
+    if cli_path and _claude_cli_basename(cli_path) not in CLAUDE_CLI_ALLOWED_BASENAMES:
+        raise ValueError(
+            f"{label}: {config_key} resolved to '{cli_path}', which is not the "
+            f"claude CLI executable."
+        )
+    if not cli_path:
+        raise ValueError(
+            f"{label}: claude CLI not found ('{configured_cli}'), "
+            f"install it in the runtime or set {config_key} in the config.toml file."
+        )
+    return cli_path
+
+
 def coerce_claude_code_timeout(value, config_key: str = "claude_code_timeout"):
     """
     把配置里的超时值解析成正的有限秒数。
@@ -714,16 +749,11 @@ def _generate_response(
             # Claude Code 官方客户端自己使用。这里不直接请求 Anthropic API，
             # 而是以 headless 模式调用本机已登录的 claude CLI（`claude -p`），
             # 由 CLI 完成鉴权，脚本生成只消费它返回的文本。
-            configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
-            cli_path = shutil.which(configured_cli)
-            if not cli_path and os.path.isfile(configured_cli):
-                cli_path = configured_cli
-            if not cli_path:
-                raise ValueError(
-                    f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
-                    f"install it in the runtime or set "
-                    f"{provider.config_key('cli_path')} in the config.toml file."
-                )
+            cli_path = resolve_claude_cli_path(
+                extra_values.get("cli_path"),
+                provider.config_key("cli_path"),
+                llm_provider,
+            )
 
             try:
                 timeout_seconds = coerce_claude_code_timeout(

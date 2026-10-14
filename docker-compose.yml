@@ -34,6 +34,11 @@ services:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
     volumes: *common-volumes
+    # Host port is bound to 127.0.0.1 above, so the container-internal 0.0.0.0
+    # listener is not reachable from the network. Remove this and set
+    # MPT_WEBUI_PASSWORD if you publish the port on other interfaces.
+    environment:
+      MPT_WEBUI_ALLOW_UNAUTHENTICATED: "1"
     restart: always
   api:
     build:
