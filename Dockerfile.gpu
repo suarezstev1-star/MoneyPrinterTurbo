@@ -1,55 +1,73 @@
-# Use NVIDIA CUDA runtime as parent image (includes CUDA 12.1 + cuDNN 8)
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# syntax=docker/dockerfile:1
 
-# Avoid interactive timezone prompt
-ENV DEBIAN_FRONTEND=noninteractive
+# NVIDIA CUDA runtime (CUDA 12.1 + cuDNN 8) on Ubuntu 22.04, pinned by tag and
+# digest. To bump: `docker buildx imagetools inspect <image>:<tag>` and update both.
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04@sha256:f4d8e1264366940438f0353da6f289c7bef069d993d111f8106086ccd18c4a30
 
-# Set the working directory in the container
+# Dependencies are installed from uv.lock (hash-verified) with uv, pinned below.
+COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /usr/local/bin/uv
+
+# Optional mirrors, OFF by default (see Dockerfile for details).
+ARG APT_MIRROR=""
+ARG PYPI_MIRROR=""
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONPATH="/MoneyPrinterTurbo" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON=/usr/bin/python3.11 \
+    UV_LINK_MODE=copy \
+    PATH="/opt/venv/bin:${PATH}" \
+    HOME=/MoneyPrinterTurbo/storage/.home \
+    HF_HOME=/MoneyPrinterTurbo/storage/.cache/huggingface \
+    XDG_CACHE_HOME=/MoneyPrinterTurbo/storage/.cache
+
 WORKDIR /MoneyPrinterTurbo
-RUN chmod 777 /MoneyPrinterTurbo
 
-ENV PYTHONPATH="/MoneyPrinterTurbo"
+# Any failing step aborts the build. Python 3.11 comes from the deadsnakes PPA
+# (Ubuntu 22.04 ships 3.10); the venv created by uv isolates it from distro
+# python packages, so the old blinker workaround is no longer needed.
+RUN set -eu; \
+    if [ -n "$APT_MIRROR" ]; then \
+        sed -i \
+            -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+            -e "s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+            /etc/apt/sources.list; \
+    fi; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        software-properties-common gpg gpg-agent git ffmpeg ca-certificates; \
+    add-apt-repository -y ppa:deadsnakes/ppa; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev; \
+    apt-get purge -y software-properties-common; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid "$APP_GID" mpt; \
+    useradd --system --uid "$APP_UID" --gid "$APP_GID" \
+        --home-dir /MoneyPrinterTurbo/storage/.home --no-create-home \
+        --shell /usr/sbin/nologin mpt; \
+    mkdir -p /MoneyPrinterTurbo/storage; \
+    chown "$APP_UID:$APP_GID" /MoneyPrinterTurbo /MoneyPrinterTurbo/storage; \
+    chmod 755 /MoneyPrinterTurbo; \
+    chmod 750 /MoneyPrinterTurbo/storage
 
-# 安装链中的任何前置步骤失败都必须终止构建。只有删除系统自带 blinker
-# 属于可忽略操作，因此把容错限制在该子命令的括号内，避免末尾的
-# `|| true` 把 apt、PPA、Python 或 pip 安装失败一并转换成成功状态。
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
-        git \
-        ffmpeg \
-        curl \
-        && add-apt-repository ppa:deadsnakes/ppa \
-        && apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 \
-        python3.11-venv \
-        python3.11-dev \
-        python3-pip \
-        && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-        && ln -sf /usr/bin/python3.11 /usr/bin/python \
-        && python3.11 -m pip install --upgrade pip \
-        && (apt-get remove -y python3-blinker || \
-            echo "python3-blinker removal skipped; continuing") \
-        && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml uv.lock .python-version ./
+RUN set -eu; \
+    if [ -n "$PYPI_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_MIRROR"; fi; \
+    uv sync --frozen --no-dev --no-install-project
 
-# Copy only the requirements.txt first to leverage Docker cache
-COPY requirements.txt ./
-
-# Install Python dependencies
-RUN python3 -m pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    --retries 3 --timeout 60 -r requirements.txt
-
-# Now copy the rest of the codebase into the image
 COPY . .
 
-# Expose the port the app runs on
+USER ${APP_UID}:${APP_GID}
+
 EXPOSE 8501
 
-# 容器内部必须监听 0.0.0.0，宿主机仍通过 docker 端口映射限制为 127.0.0.1。
-# browser.serverAddress 只决定浏览器展示的访问地址，不能替代 server.address。
+# The container must listen on 0.0.0.0; the host side restricts exposure via
+# the compose port mapping (127.0.0.1 by default).
 CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False"]

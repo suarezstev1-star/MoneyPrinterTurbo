@@ -1,111 +1,91 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim-bullseye
+# syntax=docker/dockerfile:1
 
-# Set the working directory in the container
+# Base image: Debian 12 (bookworm). Debian 11 (bullseye) is end-of-life.
+# Pinned by tag AND digest (the digest is the multi-arch index digest, so
+# amd64 and arm64 both resolve). To bump: pull the new tag, read its digest with
+#   docker buildx imagetools inspect python:3.11-slim-bookworm
+# and update both the tag and the digest below. Dependabot/Renovate can do this.
+FROM python:3.11-slim-bookworm@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89
+
+# uv is copied from its official image (pinned by tag and digest) and used to
+# install exactly what uv.lock says, hashes included.
+COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /usr/local/bin/uv
+
+# Optional mirrors, OFF by default. Only set these if you build from a network
+# where deb.debian.org / pypi.org are unreachable, and only use https mirrors
+# you trust. Example:
+#   docker build --build-arg APT_MIRROR=https://mirrors.aliyun.com/debian \
+#                --build-arg PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/ .
+# Note: with `uv sync --frozen`, uv.lock records the artifact URLs and hashes;
+# PYPI_MIRROR only changes the index uv consults and package hashes are still
+# verified against uv.lock.
+ARG APT_MIRROR=""
+ARG PYPI_MIRROR=""
+
+# Fixed non-root identity. Override at runtime with `user:` in compose when
+# bind-mounting a host directory owned by a different UID (see
+# docs/SECURITY-OPS.md).
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+ENV PYTHONPATH="/MoneyPrinterTurbo" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON=/usr/local/bin/python \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=0 \
+    PATH="/opt/venv/bin:${PATH}" \
+    HOME=/MoneyPrinterTurbo/storage/.home \
+    HF_HOME=/MoneyPrinterTurbo/storage/.cache/huggingface \
+    XDG_CACHE_HOME=/MoneyPrinterTurbo/storage/.cache
+
 WORKDIR /MoneyPrinterTurbo
 
-# 设置/MoneyPrinterTurbo目录权限为777
-RUN chmod 777 /MoneyPrinterTurbo
-
-ENV PYTHONPATH="/MoneyPrinterTurbo"
-
-# 本地用户默认继续优先使用国内镜像；GitHub Actions 发布 GHCR 镜像时使用 default，
-# 避免海外 runner 访问国内镜像过慢导致镜像发布长时间卡住。
-ARG DOCKER_BUILD_MIRROR=china
-ARG PIP_USE_OFFICIAL=0
-
-# 系统依赖安装需要同时满足两点：国内环境保留镜像回退能力，所有镜像均
-# 失败时必须让 Docker 构建立刻失败。旧循环最后执行的 sleep 总会返回 0，
-# 导致 git/ffmpeg 未安装时仍生成不可用镜像。这里把“写入软件源”“安装”
-# 和“三次重试”拆成边界清晰的 shell 函数，并用函数返回值决定是否继续。
-# 所有软件源统一使用 HTTPS，避免部分网络环境直接拦截明文 HTTP 请求。
-RUN set -u; \
-    write_debian_sources() { \
-        main_url="$1"; \
-        security_url="$2"; \
-        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\ndeb %s bullseye-security main\n' \
-            "$main_url" "$main_url" "$security_url" > /etc/apt/sources.list; \
-        rm -rf /var/lib/apt/lists/*; \
-    }; \
-    install_system_dependencies() { \
-        apt-get update && \
-        apt-get install -y --no-install-recommends git ffmpeg; \
-    }; \
-    retry_system_dependencies() { \
-        attempt=1; \
-        while [ "$attempt" -le 3 ]; do \
-            echo "Attempt $attempt: installing system dependencies"; \
-            if install_system_dependencies; then \
-                return 0; \
-            fi; \
-            echo "Attempt $attempt failed" >&2; \
-            if [ "$attempt" -lt 3 ]; then \
-                echo "Retrying in 5 seconds..." >&2; \
-                sleep 5; \
-            fi; \
-            attempt=$((attempt + 1)); \
-        done; \
-        return 1; \
-    }; \
-    if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
-        write_debian_sources \
-            "https://mirrors.aliyun.com/debian" \
-            "https://mirrors.aliyun.com/debian-security"; \
-        if ! retry_system_dependencies; then \
-            echo "Aliyun mirror failed, switching to Tsinghua mirror" >&2; \
-            write_debian_sources \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian" \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian-security"; \
-            if ! install_system_dependencies; then \
-                echo "Tsinghua mirror failed, switching to default Debian mirror" >&2; \
-                write_debian_sources \
-                    "https://deb.debian.org/debian" \
-                    "https://deb.debian.org/debian-security"; \
-                if ! install_system_dependencies; then \
-                    echo "Failed to install system dependencies from all configured mirrors" >&2; \
-                    exit 1; \
-                fi; \
-            fi; \
-        fi; \
-    else \
-        echo "Using default Debian mirrors"; \
-        write_debian_sources \
-            "https://deb.debian.org/debian" \
-            "https://deb.debian.org/debian-security"; \
-        if ! retry_system_dependencies; then \
-            echo "Failed to install system dependencies from the default Debian mirror" >&2; \
-            exit 1; \
-        fi; \
+RUN set -eu; \
+    if [ -n "$APT_MIRROR" ]; then \
+        sed -i \
+            -e "s|http://deb.debian.org/debian-security|${APT_MIRROR}-security|g" \
+            -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources; \
     fi; \
-    rm -rf /var/lib/apt/lists/*
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends git ffmpeg; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid "$APP_GID" mpt; \
+    useradd --system --uid "$APP_UID" --gid "$APP_GID" \
+        --home-dir /MoneyPrinterTurbo/storage/.home --no-create-home \
+        --shell /usr/sbin/nologin mpt; \
+    mkdir -p /MoneyPrinterTurbo/storage; \
+    chown "$APP_UID:$APP_GID" /MoneyPrinterTurbo /MoneyPrinterTurbo/storage; \
+    chmod 755 /MoneyPrinterTurbo; \
+    chmod 750 /MoneyPrinterTurbo/storage
 
-# Copy only the requirements.txt first to leverage Docker cache
-COPY requirements.txt ./
+# Dependency layer: only the manifests, so code changes do not bust the cache.
+COPY pyproject.toml uv.lock .python-version ./
+RUN set -eu; \
+    if [ -n "$PYPI_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_MIRROR"; fi; \
+    uv sync --frozen --no-dev --no-install-project
 
-# 本地默认优先国内 PyPI 镜像；GHCR 发布使用官方 PyPI，避免海外 runner 因跨境镜像访问变慢。
-RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
-        pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
-    else \
-        pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --retries 3 --timeout 60 -r requirements.txt || \
-        pip install --no-cache-dir -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn --retries 3 --timeout 60 -r requirements.txt || \
-        pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
-    fi
-
-# Now copy the rest of the codebase into the image
+# Application code stays root-owned and read-only for the runtime user. Only
+# /MoneyPrinterTurbo (for atomic config.toml writes) and storage/ are writable.
 COPY . .
 
-# Expose the port the app runs on
+USER ${APP_UID}:${APP_GID}
+
 EXPOSE 8501
 
-# 容器内部必须监听 0.0.0.0，宿主机仍通过 docker 端口映射限制为 127.0.0.1。
-# browser.serverAddress 只决定浏览器展示的访问地址，不能替代 server.address。
+# The container must listen on 0.0.0.0; the host side restricts exposure via
+# the compose port mapping (127.0.0.1 by default).
 CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False"]
 
-# 1. Build the Docker image using the following command
-# docker build -t moneyprinterturbo .
-
-# 2. Run the Docker container using the following command
-## For Linux or MacOS:
-# docker run -v $(pwd)/config.toml:/MoneyPrinterTurbo/config.toml -v $(pwd)/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
-## For Windows:
-# docker run -v ${PWD}/config.toml:/MoneyPrinterTurbo/config.toml -v ${PWD}/storage:/MoneyPrinterTurbo/storage -p 127.0.0.1:8501:8501 moneyprinterturbo
+# Build:   docker build -t moneyprinterturbo .
+#
+# Run (as UID 10001, not root). Host paths you mount must be writable by that
+# UID; or pass --user "$(id -u):$(id -g)" to run as yourself:
+#   docker run --user "$(id -u):$(id -g)" --cap-drop ALL \
+#     --security-opt no-new-privileges \
+#     -v $(pwd)/config.toml:/MoneyPrinterTurbo/config.toml \
+#     -v $(pwd)/storage:/MoneyPrinterTurbo/storage \
+#     -p 127.0.0.1:8501:8501 moneyprinterturbo

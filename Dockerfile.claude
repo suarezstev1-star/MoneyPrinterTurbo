@@ -1,24 +1,60 @@
-# Claude Code 变体镜像：在官方发布镜像的基础上安装 claude CLI。
-#
-# Claude 订阅（Pro / Max / Team）不签发 API Key，只有 Claude Code 官方客户端
-# 能使用订阅凭证，所以 `claude_code` Provider 依赖容器内存在可执行的 claude
-# CLI。这里复用发布镜像，避免重新安装 Python 依赖。
-FROM ghcr.io/harry0703/moneyprinterturbo:latest
+# syntax=docker/dockerfile:1
 
-# CLI 版本固定，避免镜像重建时行为漂移；升级时改这里的版本号即可。
+# Claude Code variant: adds the `claude` CLI on top of a released image.
+#
+# A Claude subscription (Pro / Max / Team) does not issue API keys; only the
+# official Claude Code client can use subscription credentials, so the
+# `claude_code` provider needs the CLI inside the container. We reuse the
+# released image to avoid reinstalling the Python dependencies.
+#
+# BASE_IMAGE is pinned to a release tag and digest (never :latest). To upgrade,
+# bump both, e.g. with `docker buildx imagetools inspect <image>:<tag>`.
+ARG BASE_IMAGE=ghcr.io/harry0703/moneyprinterturbo:v1.3.8@sha256:6d7277cc448861e63d5c47028843863716e7e0b35db10f517d7790bed913b93d
+FROM ${BASE_IMAGE}
+
+# The CLI version is pinned so rebuilds do not drift.
 ARG CLAUDE_CODE_VERSION=2.1.260
 ARG NODE_MAJOR=22
+# Fingerprint of the NodeSource repository signing key. The build fails if the
+# downloaded key does not match, so a swapped key cannot be installed.
+ARG NODESOURCE_KEY_FPR=6F71F525282841EEDAF851B42F59B5F99B1BE0B4
 
-# claude CLI 通过 npm 分发，发布镜像里没有 Node.js，需要先装 NodeSource 源。
+# Installing system packages needs root; the runtime user is restored below.
+USER root
+
+# Node.js comes from the signed NodeSource apt repository (no `curl | bash`):
+# the key is fetched over HTTPS, its fingerprint is verified, and apt then
+# verifies every package signature.
 RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
+    install -d -m 0755 /etc/apt/keyrings; \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key -o /tmp/nodesource.key; \
+    actual="$(gpg --show-keys --with-colons /tmp/nodesource.key | awk -F: '/^fpr:/ {print $10; exit}')"; \
+    [ "$actual" = "$NODESOURCE_KEY_FPR" ] || { echo "NodeSource key fingerprint mismatch: $actual" >&2; exit 1; }; \
+    gpg --dearmor < /tmp/nodesource.key > /etc/apt/keyrings/nodesource.gpg; \
+    rm -f /tmp/nodesource.key; \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list; \
+    apt-get update; \
     apt-get install -y --no-install-recommends nodejs; \
     npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
     npm cache clean --force; \
-    apt-get purge -y gnupg; \
+    apt-get purge -y gnupg curl; \
     apt-get autoremove -y; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*; \
     claude --version
+
+# Overlay the application code from this checkout so the claude_code provider
+# in this tree is what runs, even if the pinned base image is older. Python
+# dependencies still come from the base image.
+COPY --chown=root:root . /MoneyPrinterTurbo
+
+# 10001 is the non-root UID of current base images. A numeric USER works even
+# for older base images that have no matching passwd entry.
+USER 10001:10001
+
+# Authentication: never bake CLAUDE_CODE_OAUTH_TOKEN into the image. Supply it at
+# runtime from a restricted-permission env_file (see docker-compose.claude.yml and
+# docs/SECURITY-OPS.md).
