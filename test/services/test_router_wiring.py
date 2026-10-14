@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app import asgi
 from app.config import config
+from app.controllers import rate_limit
 from app.router import root_api_router
 
 EXPECTED_ROUTES = {
@@ -76,6 +77,9 @@ def test_every_v1_route_is_guarded_when_key_is_configured(client):
             .replace("}", "")
         )
         for method in route.methods - {"HEAD", "OPTIONS"}:
+            # Every request here is deliberately unauthenticated; reset the
+            # failed-authentication throttle so it cannot answer 429 first.
+            rate_limit.reset_all()
             response = client.request(method, path)
             assert response.status_code == 401, (method, route.path)
 
