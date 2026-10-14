@@ -9,7 +9,8 @@ from uuid import uuid4
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
 
-from app.utils import utils
+from app.config import config
+from app.utils import file_security, utils
 
 
 # Local materials are usually short clips. This matches Streamlit's default upload
@@ -291,6 +292,29 @@ def _stage_material_upload(
             pass
 
 
+def _config_number(name: str, default: float) -> float:
+    value = config.app.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(value, 0)
+
+
+def _prune_uploaded_materials(target_dir: str) -> None:
+    """Apply the retention/quota policy to user-uploaded local materials."""
+    removed = file_security.prune_upload_directory(
+        target_dir,
+        max_age_seconds=_config_number("upload_retention_days", 30) * 86400,
+        max_total_bytes=int(
+            _config_number("material_upload_quota_mb", 5120) * 1024 * 1024
+        ),
+        suffixes=SUPPORTED_MATERIAL_EXTENSIONS,
+        name_pattern=file_security.UPLOADED_FILE_NAME_PATTERN,
+        protected_prefix=_INTERNAL_UPLOAD_PREFIX[:1],
+    )
+    if removed:
+        logger.info(f"pruned {len(removed)} old local material upload(s)")
+
+
 def save_material_upload(filename: str, source: BinaryIO) -> str:
     """Validate and atomically persist an uploaded local video or image."""
     safe_name, material_kind, temp_path, total_bytes = _stage_material_upload(
@@ -306,6 +330,7 @@ def save_material_upload(filename: str, source: BinaryIO) -> str:
         else:
             _validate_image(temp_path, extension)
 
+        _prune_uploaded_materials(os.path.dirname(temp_path))
         try:
             os.replace(temp_path, target_path)
         except OSError as exc:

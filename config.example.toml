@@ -576,6 +576,31 @@ upload_post_youtube_made_for_kids = false
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
 
+# -----------------------------------------------------------------------------
+# API hardening / API 加固
+# -----------------------------------------------------------------------------
+# Extra Host header names the API accepts (DNS-rebinding protection). localhost,
+# 127.0.0.1, ::1, IP literals and this machine's hostname are always accepted.
+# When unset and the API listens on a non-loopback address with api_key set, any
+# Host is accepted. Supports "*.example.com" wildcards; "*" disables the check.
+# allowed_hosts = ["api.example.com"]
+# Per-client limit for POST requests to /api/v1 per minute (0 disables).
+# api_rate_limit_per_minute = 120
+# Failed API key attempts allowed per client address within the window before
+# further attempts get HTTP 429 (0 disables).
+# api_auth_failure_limit = 10
+# api_auth_failure_window_seconds = 300
+# Maximum simultaneous /scripts, /terms and /social-metadata requests (0 = no cap).
+# max_concurrent_llm_requests = 8
+# Maximum size in bytes of non-upload API request bodies.
+# max_request_body_bytes = 5242880
+# Uploaded local materials and background music: files older than this many days
+# are deleted on the next upload (0 disables), and the oldest uploads are removed
+# once the total exceeds the quota in MB (0 disables).
+# upload_retention_days = 30
+# material_upload_quota_mb = 5120
+# bgm_upload_quota_mb = 1024
+
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
 # =============================================================================

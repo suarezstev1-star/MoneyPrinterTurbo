@@ -1840,6 +1840,9 @@ def _run_pipeline(
     cross_post_enabled = (
         upload_post.upload_post_service.is_configured()
         and upload_post.upload_post_service.auto_upload
+        # API-created tasks default to cross_post=False (explicit opt-in);
+        # WebUI/CLI params keep the configured auto-upload behavior.
+        and getattr(params, "cross_post", True) is not False
     )
     platforms = (
         list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
