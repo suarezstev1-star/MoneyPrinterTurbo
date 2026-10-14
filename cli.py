@@ -651,7 +651,7 @@ Batch manifests:
         default=None,
         help=(
             "subtitle outline width, a finite number >= 0 (default: "
-            "[ui].stroke_width from config.toml; 1.5 when unset)"
+            "[ui].stroke_width from config.toml; 3.0 when unset)"
         ),
     )
     subtitle_group.add_argument(
