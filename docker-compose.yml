@@ -1,5 +1,21 @@
+x-hardened: &hardened
+  # Non-root runtime user. Default matches the image (UID/GID 10001). If your
+  # bind-mounted ./storage and ./config.toml belong to your host user, run
+  #   MPT_UID=$(id -u) MPT_GID=$(id -g) docker compose up -d
+  # (note: plain $UID is a shell variable and is not exported to compose).
+  user: "${MPT_UID:-10001}:${MPT_GID:-10001}"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp
+  init: true
+
 x-common-volumes: &common-volumes
-  - ./:/MoneyPrinterTurbo
+  # Mount only runtime state; code and dependencies live in the image.
+  - ./config.toml:/MoneyPrinterTurbo/config.toml
+  - ./storage:/MoneyPrinterTurbo/storage
 
 services:
   webui:
@@ -7,6 +23,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: "moneyprinterturbo-webui"
+    <<: *hardened
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4).status == 200 else 1)" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
@@ -17,6 +40,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: "moneyprinterturbo-api"
+    <<: *hardened
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/ping', timeout=4).status == 200 else 1)" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     ports:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
