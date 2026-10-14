@@ -7,9 +7,17 @@
 # =============================================================================
 # Log level: DEBUG, INFO, WARNING, or ERROR.
 log_level = "DEBUG"
-# Use 127.0.0.1 for local-only access. 0.0.0.0 listens on all network interfaces.
-listen_host = "0.0.0.0"
+# 127.0.0.1 keeps the API local-only. 0.0.0.0 listens on all network interfaces
+# and then requires app.api_key below; the API refuses to start otherwise unless
+# allow_unauthenticated_remote_api is true (only for a trusted network, e.g. a
+# Docker port already bound to 127.0.0.1 on the host). The LISTEN_HOST and
+# ALLOW_UNAUTHENTICATED_REMOTE_API environment variables override both values.
+# 127.0.0.1 仅允许本机访问。0.0.0.0 会监听所有网卡，此时必须配置 app.api_key，
+# 否则 API 拒绝启动；只有在可信网络（例如宿主机端口已绑定 127.0.0.1 的 Docker）
+# 中才应开启 allow_unauthenticated_remote_api。
+listen_host = "127.0.0.1"
 listen_port = 8080
+allow_unauthenticated_remote_api = false
 
 [app]
 
@@ -29,9 +37,12 @@ api_key = ""
 # General / 通用设置
 # -----------------------------------------------------------------------------
 
-# Hide the basic configuration panel in the WebUI.
-# 是否隐藏 WebUI 基础配置面板。
-hide_config = false
+# Optional WebUI access password (or set the MPT_WEBUI_PASSWORD environment
+# variable). When set, the WebUI shows only a password prompt until it is
+# entered. Without it, a WebUI reachable from other hosts disables the settings
+# editor and key export/import.
+# WebUI 访问密码（也可用环境变量 MPT_WEBUI_PASSWORD）。设置后需先输入密码。
+webui_password = ""
 
 # Script generation backend. "local" keeps the existing LLM workflow.
 # "loomloom" uses a configured LoomLoom Market SkillBot to return multiple
@@ -238,6 +249,15 @@ sonilo_timeout = 600
 # app/models/llm_provider.py. Leave model_name and base_url empty to follow the
 # Registry defaults; only set them when you need an explicit override.
 llm_provider = "moonshot"
+
+# LLM request reliability (all optional; defaults shown).
+# Per-request timeout in seconds for script/term generation.
+# llm_request_timeout = 120
+# Base delay in seconds for exponential backoff (with jitter) between retries.
+# Auth, model-not-found and quota errors are never retried.
+# llm_retry_base_delay = 1.0
+# Total wall-clock budget in seconds for all retries of one generation call.
+# llm_total_budget = 300
 
 # Kimi / Moonshot AI
 # API key: https://platform.kimi.com?track_id=track-6eec1e56a4494e52adcaebbcbbefce59&aff=moneyprinterturbo
@@ -575,6 +595,31 @@ upload_post_youtube_made_for_kids = false
 # rejected.
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
+
+# -----------------------------------------------------------------------------
+# API hardening / API 加固
+# -----------------------------------------------------------------------------
+# Extra Host header names the API accepts (DNS-rebinding protection). localhost,
+# 127.0.0.1, ::1, IP literals and this machine's hostname are always accepted.
+# When unset and the API listens on a non-loopback address with api_key set, any
+# Host is accepted. Supports "*.example.com" wildcards; "*" disables the check.
+# allowed_hosts = ["api.example.com"]
+# Per-client limit for POST requests to /api/v1 per minute (0 disables).
+# api_rate_limit_per_minute = 120
+# Failed API key attempts allowed per client address within the window before
+# further attempts get HTTP 429 (0 disables).
+# api_auth_failure_limit = 10
+# api_auth_failure_window_seconds = 300
+# Maximum simultaneous /scripts, /terms and /social-metadata requests (0 = no cap).
+# max_concurrent_llm_requests = 8
+# Maximum size in bytes of non-upload API request bodies.
+# max_request_body_bytes = 5242880
+# Uploaded local materials and background music: files older than this many days
+# are deleted on the next upload (0 disables), and the oldest uploads are removed
+# once the total exceeds the quota in MB (0 disables).
+# upload_retention_days = 30
+# material_upload_quota_mb = 5120
+# bgm_upload_quota_mb = 1024
 
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕

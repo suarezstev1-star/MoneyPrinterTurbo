@@ -30,7 +30,7 @@ def test_signature_drift_marks_stale_task_failed_and_drains_queue(defect):
         del stale["kwargs"]["params"]
     else:
         stale["args"] = ["another-task"]
-    client.lpop.side_effect = [json.dumps(stale), json.dumps(payload("valid"))]
+    client.eval.side_effect = [json.dumps(stale), json.dumps(payload("valid"))]
     with patch("app.controllers.manager.redis_manager.sm.state") as state:
         task = manager.dequeue()
     assert task["kwargs"]["task_id"] == "valid"
@@ -45,7 +45,7 @@ def test_signature_validation_accepts_supported_partial_callables():
     def accepts_request(task_id, params, stop_at="video"):
         pass
     bound = partial(accepts_request, stop_at="audio")
-    client.lpop.return_value = json.dumps(payload("valid"))
+    client.eval.return_value = json.dumps(payload("valid"))
     with patch.dict("app.controllers.manager.redis_manager.FUNC_MAP", {"start": bound}):
         task = manager.dequeue()
     assert task["func"] is bound

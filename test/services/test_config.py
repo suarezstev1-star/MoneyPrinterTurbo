@@ -36,7 +36,8 @@ class TestConfigPersistence:
         example_config = self._load_example_config()
         app_config = example_config["app"]
 
-        assert example_config["listen_host"] == "0.0.0.0"
+        assert example_config["listen_host"] == "127.0.0.1"
+        assert example_config["allow_unauthenticated_remote_api"] is False
         assert example_config["listen_port"] == 8080
         assert example_config["log_level"] == "DEBUG"
         assert app_config["video_source"] in {

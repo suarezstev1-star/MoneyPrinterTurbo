@@ -292,7 +292,10 @@ Batch manifests:
   custom_audio_file and local video_materials[].url values declared in a manifest are
   relative to the manifest directory. Relative paths supplied by CLI options remain
   relative to the current working directory. bgm_file and font_name keep their managed
-  storage/resource lookup rules. --stop-at is a batch-wide CLI option. The summary has
+  storage/resource lookup rules. By default every custom_audio_file and local material
+  path in a manifest (absolute, "../" or symlinked) must resolve inside the manifest's
+  directory or the project storage directory; pass --allow-outside-manifest-dir to
+  permit any path. --stop-at is a batch-wide CLI option. The summary has
   total, succeeded, failed, and tasks keys; every task entry has index, task_id,
   status, result, failed_stage, and error.
 """,
@@ -648,7 +651,7 @@ Batch manifests:
         default=None,
         help=(
             "subtitle outline width, a finite number >= 0 (default: "
-            "[ui].stroke_width from config.toml; 1.5 when unset)"
+            "[ui].stroke_width from config.toml; 3.0 when unset)"
         ),
     )
     subtitle_group.add_argument(
@@ -696,6 +699,15 @@ Batch manifests:
         help=(
             "UTF-8 JSON array or JSONL task manifest; conflicts with --task-id and "
             "generates a UUID for every task"
+        ),
+    )
+    execution_group.add_argument(
+        "--allow-outside-manifest-dir",
+        action="store_true",
+        help=(
+            "allow --batch-file manifests to reference custom_audio_file and local "
+            "video_materials[].url files outside the manifest directory and the "
+            "project storage directory (absolute paths or ../); rejected by default"
         ),
     )
     args = parser.parse_args(argv)
@@ -1143,16 +1155,44 @@ def _manifest_relative_path(raw_path: str, manifest_directory: str) -> str:
     return os.path.realpath(os.path.join(manifest_directory, expanded_path))
 
 
+def _ensure_manifest_path_allowed(
+    resolved_path: str, *, field: str, manifest_directory: str
+) -> None:
+    """Reject manifest paths that escape the manifest and storage directories."""
+    from app.utils import utils
+
+    if not resolved_path:
+        return
+    for allowed_directory in (manifest_directory, utils.storage_dir()):
+        if _path_is_within_directory(resolved_path, allowed_directory):
+            return
+    raise ValueError(
+        f"{field} must be inside the manifest directory or the project storage "
+        f"directory (use --allow-outside-manifest-dir to permit other paths): "
+        f"{resolved_path}"
+    )
+
+
 def _resolve_batch_entry_paths(
     params: VideoParams,
     *,
     override_fields: set[str],
     manifest_directory: str,
+    allow_outside_manifest_dir: bool = False,
 ) -> None:
+    def resolve(raw_path: str, field: str) -> str:
+        resolved = _manifest_relative_path(raw_path, manifest_directory)
+        if not allow_outside_manifest_dir:
+            _ensure_manifest_path_allowed(
+                os.path.realpath(resolved) if resolved else resolved,
+                field=field,
+                manifest_directory=manifest_directory,
+            )
+        return resolved
+
     if "custom_audio_file" in override_fields and params.custom_audio_file:
-        params.custom_audio_file = _manifest_relative_path(
-            params.custom_audio_file,
-            manifest_directory,
+        params.custom_audio_file = resolve(
+            params.custom_audio_file, "custom_audio_file"
         )
 
     if (
@@ -1161,10 +1201,7 @@ def _resolve_batch_entry_paths(
         and params.video_materials
     ):
         for material in params.video_materials:
-            material.url = _manifest_relative_path(
-                material.url,
-                manifest_directory,
-            )
+            material.url = resolve(material.url, "video_materials[].url")
 
 
 def _validate_batch_task_params(
@@ -1344,6 +1381,9 @@ def _build_batch_tasks(args: argparse.Namespace) -> list[VideoParams]:
                 params,
                 override_fields=override_fields,
                 manifest_directory=manifest_directory,
+                allow_outside_manifest_dir=getattr(
+                    args, "allow_outside_manifest_dir", False
+                ),
             )
             _validate_batch_task_params(
                 params,

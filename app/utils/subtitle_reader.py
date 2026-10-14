@@ -2,6 +2,22 @@
 import os
 import re
 
+from loguru import logger
+
+# SRT uses a comma before the milliseconds; many tools emit a period (WebVTT
+# style). Accept both so such cues are not silently dropped.
+_TIMESTAMP = r"[0-9]+:[0-9]+:[0-9]+[,.][0-9]+"
+_TIMESTAMP_RE = re.compile(f"({_TIMESTAMP})")
+
+
+def _timestamps(line):
+    return _TIMESTAMP_RE.findall(line)
+
+
+def _is_timing_line(line):
+    """A timing line carries a start and an end timestamp joined by ``-->``."""
+    return "-->" in line and len(_timestamps(line)) >= 2
+
 
 def file_to_subtitles(filename):
     if not filename or not os.path.isfile(filename):
@@ -13,16 +29,20 @@ def file_to_subtitles(filename):
     index = 0
     with open(filename, "r", encoding="utf-8") as f:
         for line in f:
-            times = re.findall("([0-9]*:[0-9]*:[0-9]*,[0-9]*)", line)
             # Once a cue has started, timestamps belong to its text until the
             # blank-line separator; they must not overwrite the cue's timing.
-            if times and current_times is None:
-                current_times = line
-            elif line.strip() == "" and current_times:
+            if current_times is None:
+                if _is_timing_line(line):
+                    current_times = line
+                elif _timestamps(line):
+                    logger.warning(
+                        f"skipping malformed subtitle timing line: {line.strip()!r}"
+                    )
+            elif line.strip() == "":
                 index += 1
                 times_texts.append((index, current_times.strip(), current_text.strip()))
                 current_times, current_text = None, ""
-            elif current_times:
+            else:
                 current_text += line
 
     # Flush the final block. SRT files whose last subtitle is not followed by a
@@ -40,6 +60,15 @@ def moviepy_subtitles(filename):
 
     cues = []
     for _index, timing, text in file_to_subtitles(filename):
-        start, end = re.findall("([0-9]*:[0-9]*:[0-9]*,[0-9]*)", timing)
-        cues.append(((convert_to_seconds(start), convert_to_seconds(end)), text))
+        stamps = _timestamps(timing)
+        if len(stamps) < 2:
+            logger.warning(f"skipping malformed subtitle cue: {timing!r}")
+            continue
+        try:
+            start = convert_to_seconds(stamps[0].replace(",", "."))
+            end = convert_to_seconds(stamps[1].replace(",", "."))
+        except Exception as exc:
+            logger.warning(f"skipping unparseable subtitle cue {timing!r}: {exc}")
+            continue
+        cues.append(((start, end), text))
     return cues

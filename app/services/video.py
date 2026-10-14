@@ -1,3 +1,4 @@
+import bisect
 import itertools
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
@@ -5,6 +6,7 @@ import io
 import math
 import os
 import random
+import re
 import gc
 import subprocess
 import sys
@@ -22,6 +24,7 @@ from moviepy import (
     ColorClip,
     CompositeAudioClip,
     CompositeVideoClip,
+    Effect,
     ImageClip,
     TextClip,
     VideoFileClip,
@@ -126,6 +129,23 @@ _BT709_VIDEO_FILTER = (
     "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
 )
 _BT709_FFMPEG_PARAMS = ["-vf", _BT709_VIDEO_FILTER]
+# Force 4:2:0 chroma so every player (browsers, phones, social uploaders) can decode
+# the result, whatever pixel format the encoder would otherwise pick. 4:2:0 needs
+# even dimensions, so an odd-sized frame (e.g. a 580x751 photo) loses one pixel row.
+_YUV420_VIDEO_FILTER = (
+    "crop=trunc(iw/2)*2:trunc(ih/2)*2," + _BT709_VIDEO_FILTER + ",format=yuv420p"
+)
+_BT709_FFMPEG_PARAMS = ["-vf", _YUV420_VIDEO_FILTER]
+_DEFAULT_VIDEO_CRF = 20
+_MIN_VIDEO_CRF = 0
+_MAX_VIDEO_CRF = 51
+# Temporary clips are encoded again by the concat and final passes. Keep them
+# visibly cleaner than the delivered file so quality loss does not stack up.
+_INTERMEDIATE_CRF_OFFSET = 3
+_FINAL_PRESET = "medium"
+_INTERMEDIATE_PRESET = "fast"
+_DEFAULT_RENDER_TIMEOUT_FLOOR_SECONDS = 900.0
+_DEFAULT_RENDER_TIMEOUT_PER_SECOND = 30.0
 
 
 def _get_subtitle_spring_scale(time_seconds: float, duration_seconds: float) -> float:
@@ -417,7 +437,228 @@ def _get_temp_audio_dir(output_dir: str) -> str:
     return output_dir
 
 
-def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason: str, **kwargs):
+class RenderTimeoutError(TimeoutError):
+    """Raised when a MoviePy/FFmpeg render is killed by the render watchdog."""
+
+
+_writer_tracking = threading.local()
+_writer_tracking_install_lock = threading.Lock()
+
+
+def _install_writer_tracking() -> None:
+    """
+    Make MoviePy's FFmpeg writer processes visible to the render watchdog.
+
+    MoviePy keeps the encoder Popen handle private inside ``write_videofile``,
+    so a hung encoder cannot be killed from outside. Wrapping the writer
+    constructors once lets whichever thread is rendering register its own
+    processes without touching any other thread's work.
+    """
+    with _writer_tracking_install_lock:
+        try:
+            from moviepy.audio.io import ffmpeg_audiowriter
+            from moviepy.video.io import ffmpeg_writer
+        except ImportError:  # pragma: no cover - MoviePy layout changed
+            return
+        for owner, name in (
+            (ffmpeg_writer, "FFMPEG_VideoWriter"),
+            (ffmpeg_audiowriter, "FFMPEG_AudioWriter"),
+        ):
+            cls = getattr(owner, name, None)
+            if cls is None or getattr(cls.__init__, "_mpt_tracked", False):
+                continue
+            cls.__init__ = _track_writer_init(cls.__init__)
+
+
+def _track_writer_init(original_init):
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        tracker = getattr(_writer_tracking, "tracker", None)
+        if tracker is not None:
+            tracker.register(getattr(self, "proc", None))
+
+    tracked_init._mpt_tracked = True
+    return tracked_init
+
+
+class _RenderWatchdog:
+    """Kill the FFmpeg writers a render spawns once ``timeout`` seconds pass."""
+
+    def __init__(self, timeout: float):
+        self.timeout = timeout
+        self.expired = threading.Event()
+        self._processes = []
+        self._lock = threading.Lock()
+        self._timer = None
+
+    def register(self, process) -> None:
+        if process is None:
+            return
+        with self._lock:
+            self._processes.append(process)
+            expired = self.expired.is_set()
+        if expired:
+            self._kill(process)
+
+    @staticmethod
+    def _kill(process) -> None:
+        try:
+            process.kill()
+        except Exception:  # the process may already be gone
+            pass
+
+    def _fire(self) -> None:
+        self.expired.set()
+        with self._lock:
+            processes = list(self._processes)
+        for process in processes:
+            self._kill(process)
+
+    def __enter__(self):
+        _install_writer_tracking()
+        _writer_tracking.tracker = self
+        self._timer = threading.Timer(self.timeout, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_exc):
+        if self._timer is not None:
+            self._timer.cancel()
+        _writer_tracking.tracker = None
+        return False
+
+
+def _get_render_timeout_seconds(duration: float | None) -> float:
+    """
+    Watchdog limit for one MoviePy render.
+
+    ``render_timeout_seconds`` in ``[app]`` is an absolute limit. Without it the
+    limit scales with the clip length, because encode time is proportional to
+    duration, and never drops below a floor that tolerates slow machines.
+    """
+    configured = config.app.get("render_timeout_seconds")
+    if configured not in (None, "", 0):
+        try:
+            value = float(configured)
+        except (TypeError, ValueError):
+            value = 0.0
+        if math.isfinite(value) and value > 0 and not isinstance(configured, bool):
+            return value
+        logger.warning(
+            f"invalid render_timeout_seconds={configured!r}, using the scaled default"
+        )
+    try:
+        seconds = float(duration or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if not math.isfinite(seconds) or seconds < 0:
+        seconds = 0.0
+    return max(
+        _DEFAULT_RENDER_TIMEOUT_FLOOR_SECONDS,
+        seconds * _DEFAULT_RENDER_TIMEOUT_PER_SECOND + 300.0,
+    )
+
+
+def _get_video_crf() -> int:
+    configured = config.app.get("video_crf", _DEFAULT_VIDEO_CRF)
+    if isinstance(configured, bool):
+        return _DEFAULT_VIDEO_CRF
+    try:
+        crf = int(configured)
+    except (TypeError, ValueError):
+        return _DEFAULT_VIDEO_CRF
+    return max(_MIN_VIDEO_CRF, min(_MAX_VIDEO_CRF, crf))
+
+
+def _quality_ffmpeg_params(codec: str, intermediate: bool = False) -> list[str]:
+    """
+    Constant-quality encoder flags equivalent to the libx264 CRF setting.
+
+    Hardware encoders have no CRF; each family gets its closest constant
+    quality control. They fall back to libx264 on failure, which recomputes
+    its own flags, so none of these ever reach another encoder.
+    """
+    crf = _get_video_crf()
+    if intermediate:
+        crf = max(_MIN_VIDEO_CRF, crf - _INTERMEDIATE_CRF_OFFSET)
+    if codec == "h264_nvenc":
+        params = ["-rc", "vbr", "-cq", str(min(51, crf + 3)), "-b:v", "0"]
+    elif codec == "h264_amf":
+        params = [
+            "-rc", "cqp", "-qp_i", str(min(51, crf + 2)), "-qp_p", str(min(51, crf + 4)),
+        ]
+    elif codec == "h264_qsv":
+        params = ["-global_quality", str(min(51, crf + 3))]
+    elif codec == "h264_videotoolbox":
+        params = ["-q:v", str(max(1, min(100, round(100 - crf * 2.2))))]
+    elif codec == _DEFAULT_VIDEO_CODEC:
+        params = ["-crf", str(crf)]
+    else:
+        params = []
+    if not intermediate:
+        params += ["-movflags", "+faststart"]
+    return params
+
+
+def _prepare_render_kwargs(codec: str, kwargs: dict, intermediate: bool) -> dict:
+    prepared = dict(kwargs)
+    prepared["ffmpeg_params"] = list(prepared.get("ffmpeg_params") or []) + (
+        _quality_ffmpeg_params(codec, intermediate)
+    )
+    if codec == _DEFAULT_VIDEO_CODEC:
+        prepared.setdefault(
+            "preset", _INTERMEDIATE_PRESET if intermediate else _FINAL_PRESET
+        )
+    return prepared
+
+
+def _cleanup_failed_render(output_file: str, kwargs: dict) -> None:
+    """Remove the partial video and MoviePy's temporary audio after a kill."""
+    delete_files(output_file)
+    temp_dir = kwargs.get("temp_audiofile_path") or os.path.dirname(
+        os.path.abspath(output_file)
+    )
+    stem = os.path.splitext(os.path.basename(output_file))[0]
+    try:
+        leftovers = [
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if name.startswith(f"{stem}TEMP_MPY_wvf_snd")
+        ]
+    except OSError:
+        leftovers = []
+    delete_files(leftovers)
+
+
+def _write_videofile_once(
+    clip, output_file: str, codec: str, intermediate: bool = False, **kwargs
+):
+    """One MoviePy render with quality flags and a kill-on-timeout watchdog."""
+    timeout = _get_render_timeout_seconds(getattr(clip, "duration", None))
+    prepared = _prepare_render_kwargs(codec, kwargs, intermediate)
+
+    def timeout_error() -> RenderTimeoutError:
+        _cleanup_failed_render(output_file, kwargs)
+        return RenderTimeoutError(
+            f"video render exceeded {timeout:g} seconds and was stopped; "
+            "raise [app].render_timeout_seconds for very long or slow renders"
+        )
+
+    with _RenderWatchdog(timeout) as watchdog:
+        try:
+            clip.write_videofile(output_file, codec=codec, **prepared)
+        except Exception as exc:
+            if watchdog.expired.is_set():
+                raise timeout_error() from exc
+            raise
+    if watchdog.expired.is_set():
+        raise timeout_error()
+
+
+def _fallback_write_videofile(
+    clip, output_file: str, failed_codec: str, reason: str, **kwargs
+):
     """
     硬件编码失败后用 libx264 重试，只有重试成功才禁用该硬件编码器。
 
@@ -425,7 +666,7 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     文件被占用、目录权限、杀软拦截等通用 IO 问题。只有 libx264 能成功写出时，
     才能判断原始失败大概率来自硬件编码器本身，避免误伤后续任务。
     """
-    clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
+    _write_videofile_once(clip, output_file, _DEFAULT_VIDEO_CODEC, **kwargs)
     _disable_runtime_video_codec(failed_codec, reason)
     return _DEFAULT_VIDEO_CODEC
 
@@ -438,6 +679,8 @@ def _write_videofile_with_codec_fallback(
 
     硬件编码器是否可用不仅取决于 FFmpeg，还取决于显卡、驱动和当前运行环境。
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
+    渲染超时（RenderTimeoutError）不会触发回退：卡死的编码器不能证明另一个
+    编码器可用，重试只会让用户再等一个超时周期。
     """
     kwargs.setdefault("ffmpeg_params", _BT709_FFMPEG_PARAMS)
     if atomic_output:
@@ -470,8 +713,10 @@ def _write_videofile_with_codec_fallback(
 
     effective_codec = _get_effective_video_codec(codec)
     try:
-        clip.write_videofile(output_file, codec=effective_codec, **kwargs)
+        _write_videofile_once(clip, output_file, effective_codec, **kwargs)
         return effective_codec
+    except RenderTimeoutError:
+        raise
     except Exception as exc:
         if effective_codec == _DEFAULT_VIDEO_CODEC:
             raise
@@ -622,12 +867,90 @@ def _run_concat_with_heartbeat(command: list[str], output_file: str):
         stop_event.set()
 
 
+_MAX_CROSSFADE_CLIPS = 60
+_MIN_CROSSFADE_SECONDS = 0.05
+
+
+def _probe_media_duration(file_path: str) -> float | None:
+    """Read a clip's real duration from FFmpeg's banner (no ffprobe needed)."""
+    try:
+        result = subprocess.run(
+            [utils.get_ffmpeg_binary(), "-hide_banner", "-i", file_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr or "")
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _plan_crossfade(clip_files: List[str], requested_seconds: float):
+    """
+    Return ``(overlap, durations)`` for an xfade chain, or None for hard cuts.
+
+    Offsets must follow each file's real length: frame rounding makes the
+    encoded clips differ slightly from their nominal durations, and an offset
+    past the end of its input would freeze or drop frames.
+    """
+    try:
+        overlap = float(requested_seconds or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(overlap)
+        or overlap < _MIN_CROSSFADE_SECONDS
+        or not 2 <= len(clip_files) <= _MAX_CROSSFADE_CLIPS
+    ):
+        return None
+    durations = []
+    for clip_file in clip_files:
+        duration = _probe_media_duration(clip_file)
+        if duration is None or duration <= 0:
+            return None
+        durations.append(duration)
+    overlap = min(overlap, min(durations) / 3.0)
+    if overlap < _MIN_CROSSFADE_SECONDS:
+        return None
+    return overlap, durations
+
+
+def _crossfade_input_arguments(clip_files: List[str], plan) -> list[str]:
+    overlap, durations = plan
+    command = [utils.get_ffmpeg_binary(), "-y"]
+    for clip_file in clip_files:
+        command.extend(["-i", clip_file])
+    steps = []
+    previous = "[0:v]"
+    elapsed = durations[0]
+    for index in range(1, len(clip_files)):
+        offset = max(0.0, elapsed - index * overlap)
+        label = f"[x{index}]"
+        steps.append(
+            f"{previous}[{index}:v]xfade=transition=fade:"
+            f"duration={overlap:.3f}:offset={offset:.3f}{label}"
+        )
+        previous = label
+        elapsed += durations[index]
+    steps.append(f"{previous}{_BT709_VIDEO_FILTER}[vout]")
+    command.extend(["-filter_complex", ";".join(steps), "-map", "[vout]"])
+    return command
+
+
 def concat_video_clips_with_ffmpeg(
     clip_files: List[str],
     output_file: str,
     threads: int,
     output_dir: str,
     max_duration: float | None = None,
+    crossfade_seconds: float = 0.0,
 ):
     # Separate renders may share a directory. Each FFmpeg process must keep its
     # own manifest until all codec attempts finish, without overwriting or
@@ -647,26 +970,40 @@ def concat_video_clips_with_ffmpeg(
         raise
 
     staged_output = None
+    crossfade = _plan_crossfade(clip_files, crossfade_seconds)
 
     def build_command(codec: str) -> list[str]:
-        command = [
-            utils.get_ffmpeg_binary(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_list_file,
-            "-c:v",
-            codec,
-            "-threads",
-            str(threads or 2),
-            "-vf",
-            _BT709_VIDEO_FILTER,
-            "-pix_fmt",
-            "yuv420p",
-        ]
+        if crossfade is not None:
+            command = _crossfade_input_arguments(clip_files, crossfade) + [
+                "-c:v",
+                codec,
+                "-threads",
+                str(threads or 2),
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        else:
+            command = [
+                utils.get_ffmpeg_binary(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list_file,
+                "-c:v",
+                codec,
+                "-threads",
+                str(threads or 2),
+                "-vf",
+                _BT709_VIDEO_FILTER,
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        if codec == _DEFAULT_VIDEO_CODEC:
+            command.extend(["-preset", _INTERMEDIATE_PRESET])
+        command.extend(_quality_ffmpeg_params(codec, intermediate=True))
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(staged_output)
@@ -962,6 +1299,82 @@ def _fit_clip_to_canvas(
     ).with_duration(clip.duration)
 
 
+_DEFAULT_CROSSFADE_SECONDS = 0.3
+
+# Filters applied to repeated clips so a loop does not replay identical frames.
+# Each round walks to the next entry: mirrored, zoomed to one corner, etc.
+_REPEAT_VARIANT_FILTERS = (
+    "hflip",
+    "crop=iw*0.86:ih*0.86:0:0,scale={w}:{h}",
+    "crop=iw*0.86:ih*0.86:iw*0.14:ih*0.14,scale={w}:{h}",
+    "hflip,crop=iw*0.9:ih*0.9:iw*0.05:ih*0.05,scale={w}:{h}",
+)
+
+
+def _get_default_crossfade_seconds() -> float:
+    configured = config.app.get("video_crossfade_seconds", _DEFAULT_CROSSFADE_SECONDS)
+    if isinstance(configured, bool):
+        return 0.0
+    try:
+        seconds = float(configured)
+    except (TypeError, ValueError):
+        return _DEFAULT_CROSSFADE_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        return 0.0
+    return min(seconds, 2.0)
+
+
+def _make_repeat_variant(
+    clip: SubClippedVideoClip,
+    repeat_round: int,
+    output_dir: str,
+    width: int,
+    height: int,
+) -> SubClippedVideoClip | None:
+    """
+    Re-encode ``clip`` as a mirrored/re-cropped variant for a repeated slot.
+
+    Returns None when the variant cannot be produced; the caller then repeats
+    the original file, which is always a safe fallback.
+    """
+    video_filter = _REPEAT_VARIANT_FILTERS[
+        repeat_round % len(_REPEAT_VARIANT_FILTERS)
+    ].format(w=int(width), h=int(height))
+    variant_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_dir or ".", prefix="temp-clip-", suffix=".mp4", delete=False
+        ) as handle:
+            variant_file = handle.name
+        command = [
+            utils.get_ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", clip.file_path,
+            "-vf", f"{video_filter},setsar=1",
+            "-an", "-c:v", _DEFAULT_VIDEO_CODEC, "-preset", _INTERMEDIATE_PRESET,
+            "-pix_fmt", "yuv420p",
+            *_quality_ffmpeg_params(_DEFAULT_VIDEO_CODEC, intermediate=True),
+            variant_file,
+        ]
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=False, timeout=300,
+        )
+        if result.returncode != 0 or os.path.getsize(variant_file) == 0:
+            raise RuntimeError((result.stderr or "").strip() or "empty variant")
+        return SubClippedVideoClip(
+            file_path=variant_file,
+            duration=clip.duration,
+            width=clip.width,
+            height=clip.height,
+            source_file_path=clip.source_file_path,
+        )
+    except Exception as exc:
+        logger.warning(f"could not create a repeat variant, reusing clip: {exc}")
+        if variant_file:
+            delete_files(variant_file)
+        return None
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -977,6 +1390,7 @@ def combine_videos(
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    warnings: list | None = None,
 ) -> str:
     # Pydantic leaves this optional default as the string "random" unless
     # explicitly provided. Normalize it once for all downstream enum access.
@@ -998,6 +1412,11 @@ def combine_videos(
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    # With no explicit transition, neighbouring clips dissolve into each other
+    # instead of hard-cutting. Explicit transitions keep their own behaviour.
+    crossfade_seconds = (
+        _get_default_crossfade_seconds() if not transition_value else 0.0
+    )
     normalized_clip_speed = utils.normalize_clip_speed(clip_speed)
     if normalized_clip_speed != 1.0:
         # 只记录一次最终生效值，既方便定位 API 越界参数被归一化的问题，
@@ -1017,6 +1436,7 @@ def combine_videos(
 
     processed_clips = []
     subclipped_items = []
+    source_infos = []
     video_duration = 0
     for video_path in video_paths:
         clip = None
@@ -1042,6 +1462,7 @@ def combine_videos(
             close_clip(clip)
         
         start_time = 0
+        source_infos.append((video_path, clip_w, clip_h, clip_duration))
 
         while start_time < clip_duration:
             end_time = min(start_time + source_clip_duration, clip_duration)
@@ -1188,24 +1609,25 @@ def combine_videos(
     # 片段始终在线程池里处理。逐片段日志是这一阶段唯一的进度信息，绑定到
     # 发起合成的线程后，WebUI 的任务日志才能收集到它们。
     process_clip_in_task_scope = logging_utils.bind_log_scope(process_one_clip)
-    clip_processing_workers = 1
-    if len(subclipped_items) >= 2:
-        clip_processing_workers = min(_get_clip_processing_concurrency(), len(subclipped_items))
-    with ThreadPoolExecutor(
-        max_workers=clip_processing_workers,
-        thread_name_prefix="clip-process",
-    ) as executor:
+
+    def covered_by(clip_seconds: float) -> float:
+        # Crossfaded neighbours overlap, so every clip after the first only
+        # adds its length minus the overlap to the final timeline.
+        return clip_seconds - (crossfade_seconds if processed_clips else 0.0)
+
+    def process_items(executor, items) -> None:
+        nonlocal video_duration
         next_candidate_index = 0
         while (
-            next_candidate_index < len(subclipped_items)
+            next_candidate_index < len(items)
             and video_duration < required_video_duration
         ):
             remaining_duration = required_video_duration - video_duration
             batch = []
             batch_duration = 0.0
             candidate_index = next_candidate_index
-            while candidate_index < len(subclipped_items) and batch_duration < remaining_duration:
-                subclipped_item = subclipped_items[candidate_index]
+            while candidate_index < len(items) and batch_duration < remaining_duration:
+                subclipped_item = items[candidate_index]
                 source_duration = subclipped_item.end_time - subclipped_item.start_time
                 output_duration = min(
                     max_clip_duration,
@@ -1219,8 +1641,8 @@ def combine_videos(
             for processed_clip in executor.map(process_clip_in_task_scope, batch):
                 if processed_clip is None:
                     continue
+                video_duration += covered_by(processed_clip.duration)
                 processed_clips.append(processed_clip)
-                video_duration += processed_clip.duration
                 # 每段 4K 素材要处理十几秒，逐段报告覆盖时长，日志和进度条
                 # 才能反映这一阶段仍在推进。
                 logger.info(
@@ -1231,25 +1653,87 @@ def combine_videos(
                     progress_callback, video_duration, required_video_duration
                 )
             next_candidate_index = candidate_index
-    
-    # loop processed clips until the video duration covers the audio duration and the small safety margin.
-    if video_duration < required_video_duration:
+
+    clip_processing_workers = 1
+    if len(subclipped_items) >= 2:
+        clip_processing_workers = min(_get_clip_processing_concurrency(), len(subclipped_items))
+    with ThreadPoolExecutor(
+        max_workers=clip_processing_workers,
+        thread_name_prefix="clip-process",
+    ) as executor:
+        process_items(executor, subclipped_items)
+        if (
+            video_duration < required_video_duration
+            and video_concat_mode.value == VideoConcatMode.sequential.value
+        ):
+            # Sequential mode only schedules the first slice of each source.
+            # Before repeating anything, use the unseen remainder of the footage.
+            extra_items = []
+            for source_path, source_w, source_h, source_length in source_infos:
+                extra_start = source_clip_duration
+                while extra_start < source_length:
+                    extra_end = min(extra_start + source_clip_duration, source_length)
+                    if extra_end > extra_start:
+                        extra_items.append(
+                            SubClippedVideoClip(
+                                file_path=source_path,
+                                start_time=extra_start,
+                                end_time=extra_end,
+                                width=source_w,
+                                height=source_h,
+                                source_file_path=source_path,
+                            )
+                        )
+                    extra_start = extra_end
+            if extra_items:
+                logger.info(
+                    f"footage is short; using {len(extra_items)} unused source "
+                    "segments before repeating clips"
+                )
+                process_items(executor, extra_items)
+
+    # Footage still shorter than the narration: repeat clips, but as visibly
+    # different variants (mirrored / re-cropped) rather than identical frames.
+    if video_duration < required_video_duration and processed_clips:
         logger.warning(
             f"video duration ({video_duration:.2f}s) is shorter than required duration "
-            f"({required_video_duration:.2f}s), looping clips to match audio length."
+            f"({required_video_duration:.2f}s), repeating clips to match audio length."
         )
         base_clips = processed_clips.copy()
+        repeated_clips = 0
+        variant_clips = 0
         for clip in itertools.cycle(base_clips):
             if video_duration >= required_video_duration:
                 break
-            processed_clips.append(clip)
-            video_duration += clip.duration
+            repeat_round = repeated_clips // len(base_clips)
+            variant = _make_repeat_variant(
+                clip, repeat_round, output_dir, video_width, video_height
+            )
+            if variant is not None:
+                variant_clips += 1
+            repeated = variant or clip
+            video_duration += covered_by(repeated.duration)
+            processed_clips.append(repeated)
+            repeated_clips += 1
         logger.info(
             f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
             f"required duration: {required_video_duration:.2f}s, "
-            f"looped {len(processed_clips)-len(base_clips)} clips"
+            f"repeated {repeated_clips} clips ({variant_clips} as variants)"
         )
-     
+        if warnings is not None:
+            warnings.append(
+                {
+                    "code": "footage_repeated",
+                    "repeated_clips": repeated_clips,
+                    "variant_clips": variant_clips,
+                    "message": (
+                        "The footage was shorter than the narration, so "
+                        f"{repeated_clips} clips were repeated. Add more or longer "
+                        "footage to avoid repetition."
+                    ),
+                }
+            )
+
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
     if not processed_clips:
@@ -1267,6 +1751,7 @@ def combine_videos(
             threads=threads,
             output_dir=output_dir,
             max_duration=audio_duration,
+            crossfade_seconds=crossfade_seconds,
         )
         if used_video_paths is not None:
             # Exclude safety-margin clips that FFmpeg trims entirely from the output.
@@ -1555,6 +2040,388 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+_DEFAULT_SUBTITLE_FONT = "STHeitiMedium.ttc"
+# Fonts in resource/fonts, best first. The CJK-first default only suits CJK
+# text: it renders Latin in a thin CJK face and has no Vietnamese glyphs, so
+# non-CJK text prefers the bold Latin/Vietnamese face and falls back from there.
+_LATIN_FONT_PREFERENCE = (
+    "BeVietnamPro-Bold.ttf",
+    "BeVietnamPro-Medium.ttf",
+    "STHeitiMedium.ttc",
+    "MicrosoftYaHeiBold.ttc",
+    "STHeitiLight.ttc",
+    "MicrosoftYaHeiNormal.ttc",
+)
+_CJK_FONT_PREFERENCE = (
+    "STHeitiMedium.ttc",
+    "MicrosoftYaHeiBold.ttc",
+    "STHeitiLight.ttc",
+    "MicrosoftYaHeiNormal.ttc",
+)
+_MAX_COVERAGE_SAMPLE_CHARS = 400
+
+# Unicode blocks whose text needs a shaping/bidi engine (libraqm) to look right:
+# Hebrew, Arabic and its presentation forms, then the Indic and Thai scripts.
+_COMPLEX_SCRIPT_RANGES = (
+    (0x0590, 0x08FF),
+    (0x0900, 0x0DFF),
+    (0x0E00, 0x0E7F),
+    (0xFB1D, 0xFDFF),
+    (0xFE70, 0xFEFF),
+)
+_CJK_RANGES = (
+    (0x3040, 0x30FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),
+    (0xF900, 0xFAFF),
+)
+
+
+def _text_has_chars_in(text: str, ranges) -> bool:
+    return any(
+        low <= ord(char) <= high for char in text for low, high in ranges
+    )
+
+
+def _raqm_available() -> bool:
+    try:
+        from PIL import features
+
+        return bool(features.check("raqm"))
+    except Exception:  # pragma: no cover - Pillow without feature probing
+        return False
+
+
+def _coverage_sample(text: str) -> str:
+    return "".join(
+        dict.fromkeys(
+            char
+            for char in str(text or "")
+            if unicodedata.category(char)[0] in {"L", "N"}
+        )
+    )[:_MAX_COVERAGE_SAMPLE_CHARS]
+
+
+def _font_covers_text(font_path: str, text: str) -> bool:
+    sample = _coverage_sample(text)
+    return not sample or _subtitle_font_supports_sample(font_path, sample)
+
+
+def _list_bundled_fonts() -> list[str]:
+    try:
+        return sorted(
+            name
+            for name in os.listdir(utils.font_dir())
+            if name.lower().endswith((".ttf", ".ttc", ".otf"))
+        )
+    except OSError:
+        return []
+
+
+def _resolve_subtitle_font(
+    font_name: str | None, text: str
+) -> tuple[str, list[dict]]:
+    """
+    Pick the subtitle font for ``text`` and report what could not be honoured.
+
+    The shipped default (a CJK face) is replaced by a script-appropriate bundled
+    font. An explicitly chosen font that lacks the needed glyphs is swapped for
+    a bundled font that has them. When nothing covers the text, or complex
+    scripts would be drawn unshaped, the render still proceeds and the problem
+    is returned as a warning instead of being left as silent tofu.
+    """
+    warnings: list[dict] = []
+    requested = font_name or _DEFAULT_SUBTITLE_FONT
+    sample = _coverage_sample(text)
+    if not sample:
+        return requested, warnings
+
+    fonts_dir = utils.font_dir()
+    bundled = _list_bundled_fonts()
+    is_default = requested == _DEFAULT_SUBTITLE_FONT
+    chosen = requested
+
+    def usable(name: str) -> bool:
+        return name in bundled and _font_covers_text(
+            os.path.join(fonts_dir, name), text
+        )
+
+    if is_default:
+        preference = (
+            _CJK_FONT_PREFERENCE
+            if _text_has_chars_in(sample, _CJK_RANGES)
+            else _LATIN_FONT_PREFERENCE
+        )
+        for candidate in preference:
+            if usable(candidate):
+                chosen = candidate
+                break
+        if chosen != requested:
+            logger.info(f"default subtitle font replaced for this text: {chosen}")
+    else:
+        try:
+            requested_path = file_security.resolve_path_within_directory(
+                fonts_dir, requested
+            )
+        except ValueError:
+            # Path validation reports its own, clearer error later.
+            return requested, warnings
+        if not _font_covers_text(requested_path, text):
+            replacement = next(
+                (
+                    name
+                    for name in (*_LATIN_FONT_PREFERENCE, *_CJK_FONT_PREFERENCE, *bundled)
+                    if usable(name)
+                ),
+                None,
+            )
+            if replacement:
+                chosen = replacement
+                warnings.append(
+                    {
+                        "code": "subtitle_font_replaced",
+                        "font": requested,
+                        "replacement": replacement,
+                        "message": (
+                            f"Font {requested} lacks glyphs used by the subtitles; "
+                            f"{replacement} was used instead."
+                        ),
+                    }
+                )
+
+    try:
+        chosen_path = file_security.resolve_path_within_directory(fonts_dir, chosen)
+    except ValueError:
+        return chosen, warnings
+    if not _font_covers_text(chosen_path, text):
+        warnings.append(
+            {
+                "code": "subtitle_glyphs_missing",
+                "font": chosen,
+                "message": (
+                    f"No bundled font covers every character of the subtitles; "
+                    f"some will render as empty boxes with {chosen}."
+                ),
+            }
+        )
+    if _text_has_chars_in(sample, _COMPLEX_SCRIPT_RANGES) and not _raqm_available():
+        warnings.append(
+            {
+                "code": "subtitle_complex_script_unshaped",
+                "message": (
+                    "The subtitles use a right-to-left or complex script, but Pillow "
+                    "was built without libraqm, so letters are not joined or ordered "
+                    "correctly. Install libraqm (libraqm0) for correct rendering."
+                ),
+            }
+        )
+    for warning in warnings:
+        logger.warning(warning["message"])
+    return chosen, warnings
+
+
+class _RenderedSubtitle:
+    """A rendered cue plus the on-screen origin of its top-left corner."""
+
+    def __init__(self, clip, x: int, y: int, start: float, end: float, static_after: float):
+        self.clip = clip
+        self.x = x
+        self.y = y
+        self.start = start
+        self.end = end
+        self.static_after = static_after
+        self._static = None
+
+    def frame_at(self, seconds: float):
+        relative = min(max(seconds - self.start, 0.0), self.clip.duration or 0.0)
+        if relative >= self.static_after and self._static is not None:
+            return self._static
+        rgb = self.clip.get_frame(relative)
+        mask = self.clip.mask.get_frame(relative) if self.clip.mask is not None else None
+        pair = (rgb, mask)
+        if relative >= self.static_after:
+            self._static = pair
+        return pair
+
+    def close(self) -> None:
+        # Text clips hold only in-memory images (no reader or process), so
+        # dropping the references is enough; close_clip's full collection per
+        # cue would dominate the encode on long word-by-word subtitles.
+        self.clip = None
+        self._static = None
+
+
+class _LazySubtitleOverlay:
+    """
+    Burn subtitles into frames as they are encoded.
+
+    Rendering every cue up front keeps one text image (plus background and
+    mask) per cue alive for the whole encode, which reaches gigabytes for long
+    word-by-word subtitles. Here a cue is rendered when playback reaches it and
+    only a few recent cues stay cached.
+    """
+
+    def __init__(self, cues, build_cue: Callable, cache_size: int = 3):
+        ordered = sorted(cues, key=lambda cue: cue[0][0])
+        self._cues = ordered
+        self._starts = [cue[0][0] for cue in ordered]
+        self._ends = [cue[0][1] for cue in ordered]
+        self._build_cue = build_cue
+        self._cache_size = max(1, cache_size)
+        self._cache: dict[int, _RenderedSubtitle] = {}
+        self._order: list[int] = []
+        self._lock = threading.Lock()
+
+    def _entry(self, index: int) -> _RenderedSubtitle:
+        with self._lock:
+            entry = self._cache.get(index)
+            if entry is not None:
+                self._order.remove(index)
+                self._order.append(index)
+                return entry
+            entry = self._build_cue(self._cues[index])
+            self._cache[index] = entry
+            self._order.append(index)
+            while len(self._order) > self._cache_size:
+                evicted = self._cache.pop(self._order.pop(0))
+                evicted.close()
+            return entry
+
+    def _active_indices(self, seconds: float) -> list[int]:
+        upper = bisect.bisect_right(self._starts, seconds)
+        active = [
+            index
+            for index in range(upper - 1, max(-1, upper - 9), -1)
+            if seconds < self._ends[index]
+        ]
+        active.reverse()
+        return active
+
+    def apply(self, get_frame, seconds):
+        frame = get_frame(seconds)
+        active = self._active_indices(float(seconds))
+        if not active:
+            return frame
+        output = frame.copy()
+        frame_height, frame_width = output.shape[:2]
+        for index in active:
+            entry = self._entry(index)
+            rgb, mask = entry.frame_at(float(seconds))
+            cue_height, cue_width = rgb.shape[:2]
+            x0, y0 = max(0, entry.x), max(0, entry.y)
+            x1 = min(frame_width, entry.x + cue_width)
+            y1 = min(frame_height, entry.y + cue_height)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            source = rgb[y0 - entry.y : y1 - entry.y, x0 - entry.x : x1 - entry.x, :3]
+            if mask is None:
+                output[y0:y1, x0:x1] = source
+                continue
+            alpha = mask[y0 - entry.y : y1 - entry.y, x0 - entry.x : x1 - entry.x]
+            alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)[..., None]
+            region = output[y0:y1, x0:x1].astype(np.float32)
+            blended = region * (1.0 - alpha) + source.astype(np.float32) * alpha
+            output[y0:y1, x0:x1] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+        return output
+
+    def close(self) -> None:
+        with self._lock:
+            for entry in self._cache.values():
+                entry.close()
+            self._cache.clear()
+            self._order.clear()
+
+
+_DUCKING_WINDOW_SECONDS = 0.05
+_DUCKING_CHUNK_SECONDS = 2.0
+_DUCKING_GAIN = 0.35
+_DUCKING_ATTACK_SECONDS = 0.12
+_DUCKING_RELEASE_SECONDS = 0.5
+_DUCKING_HOLD_SECONDS = 0.3
+
+
+def _voice_ducking_gain_curve(voice_clip) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Per-window music gain that dips while the narration is speaking.
+
+    Window RMS decides when the voice is active; a short hold keeps the music
+    down across the gaps between words, and separate attack/release smoothing
+    avoids pumping. Returns ``(times, gains)`` or None for a silent voice.
+    """
+    # Analyse at the clip's own sample rate: MoviePy returns silence when an
+    # audio file is resampled on read.
+    rate = int(getattr(voice_clip, "fps", 0) or 44100)
+    window = max(1, int(rate * _DUCKING_WINDOW_SECONDS))
+    window_seconds = window / rate
+    levels: list[np.ndarray] = []
+    leftover = np.zeros(0, dtype=np.float32)
+    # Read explicit in-range timestamps: MoviePy's iter_chunks overshoots the end
+    # and an out-of-range read of a short clip comes back as pure silence.
+    total_samples = int(float(voice_clip.duration) * rate)
+    chunk_samples = int(_DUCKING_CHUNK_SECONDS * rate)
+    for first in range(0, total_samples, chunk_samples):
+        timings = np.arange(first, min(first + chunk_samples, total_samples)) / rate
+        chunk = voice_clip.to_soundarray(
+            tt=timings, fps=rate, quantize=False, buffersize=chunk_samples
+        )
+        mono = np.asarray(chunk, dtype=np.float32)
+        if mono.ndim == 2:
+            mono = mono.mean(axis=1)
+        mono = np.concatenate([leftover, mono])
+        usable = (len(mono) // window) * window
+        if usable:
+            blocks = mono[:usable].reshape(-1, window)
+            levels.append(np.sqrt((blocks * blocks).mean(axis=1)))
+        leftover = mono[usable:]
+    if len(leftover):
+        padded = np.zeros(window, dtype=np.float32)
+        padded[: len(leftover)] = leftover
+        levels.append(np.array([np.sqrt((padded * padded).mean())], dtype=np.float32))
+    if not levels:
+        return None
+    rms = np.concatenate(levels)
+    speech = rms[rms > 1e-4]
+    if speech.size == 0:
+        return None
+    threshold = max(0.004, 0.08 * float(np.percentile(speech, 90)))
+    active = (rms > threshold).astype(np.float32)
+    hold = max(1, int(round(_DUCKING_HOLD_SECONDS / window_seconds)))
+    active = (np.convolve(active, np.ones(hold, dtype=np.float32), mode="full")[
+        hold // 2 : hold // 2 + len(active)
+    ] > 0).astype(np.float32)
+    target = 1.0 - active * (1.0 - _DUCKING_GAIN)
+    attack = 1.0 - math.exp(-window_seconds / _DUCKING_ATTACK_SECONDS)
+    release = 1.0 - math.exp(-window_seconds / _DUCKING_RELEASE_SECONDS)
+    gains = np.empty_like(target)
+    current = 1.0
+    for index, goal in enumerate(target):
+        current += (goal - current) * (attack if goal < current else release)
+        gains[index] = current
+    times = (np.arange(len(gains)) + 0.5) * window_seconds
+    return times, gains
+
+
+class _VoiceDucking(Effect):
+    """Multiply music by a gain curve computed from the narration."""
+
+    def __init__(self, times: np.ndarray, gains: np.ndarray):
+        self.times = times
+        self.gains = gains
+
+    def apply(self, clip):
+        times, gains = self.times, self.gains
+
+        def duck(get_frame, seconds):
+            frame = get_frame(seconds)
+            gain = np.interp(np.atleast_1d(seconds), times, gains)
+            if np.ndim(seconds) == 0:
+                return frame * float(gain[0])
+            return frame * gain[:, None]
+
+        return clip.transform(duck)
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1562,9 +2429,14 @@ def generate_video(
     output_file: str,
     params: VideoParams,
     bgm_file_override: str | None = None,
+    warnings: list | None = None,
 ) -> bool:
     """
     合成最终视频，并返回本次背景音乐处理是否成功。
+
+    ``warnings`` 是可选的输出列表：字体替换、缺字形、复杂文字无法正确排版等
+    不会中断渲染的问题会以 ``{"code", "message", ...}`` 字典追加到其中，由任务
+    编排层转交给用户，而不是静默输出方框字。
 
     返回值只描述 BGM 处理状态：没有请求 BGM 或成功混合时返回 True；请求了
     BGM 但加载、特效或混合失败时返回 False。即使 BGM 失败仍会继续输出只有
@@ -1585,14 +2457,28 @@ def generate_video(
     output_dir = os.path.dirname(output_file)
 
     font_path = ""
+    subtitle_cues = []
     if params.subtitle_enabled:
         if not params.font_name:
-            params.font_name = "STHeitiMedium.ttc"
+            params.font_name = _DEFAULT_SUBTITLE_FONT
+        font_name = params.font_name
+        if subtitle_path and os.path.exists(subtitle_path):
+            try:
+                subtitle_cues = moviepy_subtitles(subtitle_path)
+            except Exception as exc:
+                # 解析错误沿用原有路径：稍后由字幕加载阶段给出同样的异常。
+                logger.debug(f"subtitle pre-read failed, deferring error: {exc}")
+        if subtitle_cues:
+            font_name, font_warnings = _resolve_subtitle_font(
+                font_name, " ".join(text for _, text in subtitle_cues)
+            )
+            if warnings is not None:
+                warnings.extend(font_warnings)
         # API 入口虽已预检，WebUI、CLI 和内部调用仍可直接进入渲染层；
         # 始终以真实路径校验字体必须留在 resource/fonts，阻断绝对路径、
         # ../ 穿越及指向目录外的符号链接，再交给 PIL/MoviePy 打开。
         font_path = file_security.resolve_path_within_directory(
-            utils.font_dir(), params.font_name
+            utils.font_dir(), font_name
         )
         if os.name == "nt":
             font_path = font_path.replace("\\", "/")
@@ -1755,27 +2641,46 @@ def generate_video(
         if anim_type in ("pop_spring", "spring", "pop"):
             _clip = _apply_subtitle_spring_animation(_clip, duration)
 
+        return _clip
+
+    def subtitle_origin(clip_w, clip_h, canvas_w, canvas_h):
+        """Top-left pixel of a cue; the same placement rules as before."""
+        x = (canvas_w - clip_w) / 2
         if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
+            y = video_height * 0.95 - clip_h
         elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
+            y = video_height * 0.05
         elif params.subtitle_position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
-            # 2/3 from the bottom = 1/3 from the top: y = (video_height - _clip.h) * (1/3)
-            y_two_thirds = (video_height - _clip.h) / 3.0
-            _clip = _clip.with_position(("center", y_two_thirds))
+            # 2/3 from the bottom = 1/3 from the top: y = (video_height - h) * (1/3)
+            y = (video_height - clip_h) / 3.0
         elif params.subtitle_position == "custom":
             # Ensure the subtitle is fully within the screen bounds
             margin = 10  # Additional margin, in pixels
-            max_y = video_height - _clip.h - margin
+            max_y = video_height - clip_h - margin
             min_y = margin
-            custom_y = (video_height - _clip.h) * (params.custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )  # Constrain the y value within the valid range
-            _clip = _clip.with_position(("center", custom_y))
+            custom_y = (video_height - clip_h) * (params.custom_position / 100)
+            y = max(min_y, min(custom_y, max_y))
         else:  # center
-            _clip = _clip.with_position(("center", "center"))
-        return _clip
+            y = (canvas_h - clip_h) / 2
+        return int(round(x)), int(round(y))
+
+    def build_subtitle_cue(subtitle_item, canvas_w, canvas_h):
+        cue_clip = create_text_clip(subtitle_item=subtitle_item)
+        anim_type = getattr(params, "subtitle_animation", "none")
+        animated = anim_type in ("pop_spring", "spring", "pop")
+        x, y = subtitle_origin(cue_clip.w, cue_clip.h, canvas_w, canvas_h)
+        start, end = subtitle_item[0]
+        cue_duration = max(0.0, end - start)
+        return _RenderedSubtitle(
+            cue_clip,
+            x,
+            y,
+            start,
+            end,
+            static_after=(
+                min(_SUBTITLE_SPRING_DURATION_SECONDS, cue_duration) if animated else 0.0
+            ),
+        )
 
     # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
     # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
@@ -1800,17 +2705,21 @@ def generate_video(
         if params.subtitle_enabled and subtitle_path and os.path.exists(subtitle_path):
             sub = clip_stack.enter_context(
                 SubtitlesClip(
-                    subtitles=moviepy_subtitles(subtitle_path),
+                    subtitles=subtitle_cues or moviepy_subtitles(subtitle_path),
                     encoding="utf-8",
                     make_textclip=make_textclip,
                 )
             )
-            text_clips = []
-            for item in sub.subtitles:
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
-            video_clip = CompositeVideoClip([video_clip, *text_clips])
-            clip_stack.callback(video_clip.close)
+            # Cues are rendered lazily while frames are encoded and only a few
+            # stay cached; building them all here held every cue's text image,
+            # background and mask in memory at once.
+            canvas_w, canvas_h = (int(value) for value in video_clip.size)
+            overlay = _LazySubtitleOverlay(
+                sub.subtitles,
+                lambda item: build_subtitle_cue(item, canvas_w, canvas_h),
+            )
+            clip_stack.callback(overlay.close)
+            video_clip = video_clip.transform(overlay.apply)
 
         bgm_enabled = bgm_service.should_use_bgm(
             params.bgm_type, params.bgm_volume
@@ -1839,15 +2748,31 @@ def generate_video(
         if bgm_file:
             try:
                 bgm_effects = [afx.MultiplyVolume(params.bgm_volume)]
+                bgm_source_clip = clip_stack.enter_context(AudioFileClip(bgm_file))
+                bgm_input = bgm_source_clip
                 # 服务内解析的随机/自定义音乐可能比成片短，需要循环铺满；任务层
                 # 通过 override 传入的文件表示提供商已经完成时长适配。这里依据
                 # 文件来源决定是否循环，避免今后每增加一个提供商都修改名称白名单。
                 if bgm_file_override is None:
                     bgm_effects.append(afx.AudioLoop(duration=video_clip.duration))
+                else:
+                    # Provider tracks may run past the video. Fade-out is relative
+                    # to the clip end, so cut the track to the video first or the
+                    # fade would happen after the video has already finished.
+                    provider_length = getattr(bgm_source_clip, "duration", None)
+                    if provider_length and provider_length > video_clip.duration:
+                        bgm_input = bgm_source_clip.subclipped(0, video_clip.duration)
+                if getattr(params, "bgm_ducking", True):
+                    try:
+                        curve = _voice_ducking_gain_curve(audio_clip)
+                    except Exception as exc:
+                        curve = None
+                        logger.warning(f"skipping music ducking: {exc}")
+                    if curve is not None:
+                        bgm_effects.append(_VoiceDucking(*curve))
                 # Fade the complete playback timeline, not each source loop.
                 bgm_effects.append(afx.AudioFadeOut(3))
-                bgm_source_clip = clip_stack.enter_context(AudioFileClip(bgm_file))
-                bgm_clip = bgm_source_clip.with_effects(bgm_effects)
+                bgm_clip = bgm_input.with_effects(bgm_effects)
                 audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
             except Exception:
                 bgm_mix_succeeded = False
@@ -1880,6 +2805,31 @@ def generate_video(
         return bgm_mix_succeeded
 
 
+# Largest canvas edge is 1920 px; keeping the photo at about 1.2x of that leaves
+# room for the zoom and a cover-crop while avoiding 20+ megapixel frames.
+_IMAGE_ZOOM_MIN_SIDE_PX = 2304
+_IMAGE_ZOOM_MAX_SIDE_PX = 4608
+
+
+def _image_zoom_working_size(width: int, height: int) -> tuple[int, int]:
+    """Size to render a photo at: never larger than needed, never upscaled."""
+    width, height = int(width), int(height)
+    if min(width, height) <= 0:
+        return width, height
+    scale = 1.0
+    if min(width, height) > _IMAGE_ZOOM_MIN_SIDE_PX:
+        scale = _IMAGE_ZOOM_MIN_SIDE_PX / min(width, height)
+    if max(width, height) * scale > _IMAGE_ZOOM_MAX_SIDE_PX:
+        scale = _IMAGE_ZOOM_MAX_SIDE_PX / max(width, height)
+    if scale >= 1.0:
+        return width, height
+    # H.264 needs even dimensions.
+    return (
+        max(2, int(round(width * scale / 2)) * 2),
+        max(2, int(round(height * scale / 2)) * 2),
+    )
+
+
 def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
     """
     将单张本地图片渲染为带缓慢放大效果的 mp4 片段，返回输出文件路径。
@@ -1892,13 +2842,26 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
     clip, _ = _open_image_clip_with_fallback(image_path)
     clip = clip.with_duration(clip_duration).with_position("center")
     temp_path = ""
+    zoom_source = clip
     try:
+        # Phone photos are 12-48 MP. Every frame of the zoom resamples the whole
+        # image, so downscale once up front to a size the canvas can use.
+        source_size = getattr(clip, "size", None)
+        working_size = (
+            _image_zoom_working_size(*source_size) if source_size else None
+        )
+        if working_size and working_size != tuple(int(v) for v in source_size):
+            logger.info(
+                f"downscaling photo {clip.size[0]}x{clip.size[1]} -> "
+                f"{working_size[0]}x{working_size[1]} before zoom render"
+            )
+            zoom_source = clip.resized(new_size=working_size)
         # Apply a zoom effect using the resize method.
         # A lambda function is used to make the zoom effect dynamic over time.
         # The zoom effect starts from the original size and gradually scales up to 120%.
         # t represents the current time, and clip.duration is the total duration of the clip.
         # Note: 1 represents 100% size, so 1.2 represents 120%.
-        zoom_clip = clip.resized(
+        zoom_clip = zoom_source.resized(
             lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
         )
 
@@ -1926,8 +2889,14 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
                 dir=os.path.dirname(os.path.abspath(video_file)),
             )
             os.close(descriptor)
-            final_clip.write_videofile(
-                temp_path, fps=30, logger=None, ffmpeg_params=_BT709_FFMPEG_PARAMS
+            _write_videofile_with_codec_fallback(
+                final_clip,
+                temp_path,
+                codec=_DEFAULT_VIDEO_CODEC,
+                intermediate=True,
+                fps=30,
+                logger=None,
+                ffmpeg_params=_BT709_FFMPEG_PARAMS,
             )
         finally:
             close_clip(final_clip)
@@ -1935,6 +2904,8 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
         temp_path = ""
         return video_file
     finally:
+        if zoom_source is not clip:
+            close_clip(zoom_source)
         close_clip(clip)
         if temp_path:
             delete_files(temp_path)

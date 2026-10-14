@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from app.config import config
 from app.utils import file_security, utils
 
 
@@ -142,6 +143,12 @@ def sanitize_upload_filename(filename: str) -> str:
     return safe_name
 
 
+_DECODE_ERROR_MARKERS = (
+    b"Decoder thread returned error",
+    b"Error processing packet in decoder",
+)
+
+
 def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
     """
     仅使用项目当前配置的 FFmpeg 验证文件包含可完整解码的音频流。
@@ -169,15 +176,17 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
                 file_path,
                 "-map",
                 "0:a:0",
-                # Normalize timestamps from decoded samples. A header-only
-                # WAV can exit successfully without producing any audio.
-                "-af",
-                "asetpts=N/SR/TB",
-                "-progress",
-                "pipe:1",
-                "-nostats",
+                # Emit the decoded samples as tiny mono PCM and require a
+                # non-empty stream. A header-only WAV can exit successfully
+                # without producing any audio. Counting output bytes is more
+                # reliable than ``-progress out_time_us``, which FFmpeg 6.1
+                # reports as 0 for clips shorter than a few hundred ms.
+                "-ac",
+                "1",
+                "-ar",
+                "4000",
                 "-f",
-                "null",
+                "s16le",
                 "-",
             ],
             capture_output=True,
@@ -190,14 +199,12 @@ def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
         raise BgmServiceError("failed to run FFmpeg for background music validation") from exc
     if decoded.returncode != 0:
         raise BgmUploadError("uploaded file must contain a decodable audio stream")
-    decoded_audio = False
-    for line in decoded.stdout.splitlines():
-        key, separator, value = line.partition(b"=")
-        if separator and key == b"out_time_us":
-            try:
-                decoded_audio = decoded_audio or int(value) > 0
-            except ValueError:
-                continue
+    # FFmpeg 6.1 can log "Decoder thread returned error" yet still exit 0 under
+    # -xerror (fixed in 7.0), so a damaged stream must also be caught on stderr.
+    stderr = getattr(decoded, "stderr", None) or b""
+    if any(marker in stderr for marker in _DECODE_ERROR_MARKERS):
+        raise BgmUploadError("uploaded file must contain a decodable audio stream")
+    decoded_audio = bool(decoded.stdout)
     if not decoded_audio:
         raise BgmUploadError("uploaded file must contain nonempty decodable audio")
 
@@ -290,6 +297,27 @@ def validate_bgm_upload(filename: str, source: BinaryIO) -> str:
         _remove_staged_file(temp_path)
 
 
+def _config_number(name: str, default: float) -> float:
+    value = config.app.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(value, 0)
+
+
+def _prune_uploaded_bgm(target_dir: str) -> None:
+    """Apply the retention/quota policy to user-uploaded background music."""
+    removed = file_security.prune_upload_directory(
+        target_dir,
+        max_age_seconds=_config_number("upload_retention_days", 30) * 86400,
+        max_total_bytes=int(_config_number("bgm_upload_quota_mb", 1024) * 1024 * 1024),
+        suffixes=tuple(SUPPORTED_BGM_EXTENSIONS),
+        name_pattern=file_security.UPLOADED_FILE_NAME_PATTERN,
+        protected_prefix=_INTERNAL_UPLOAD_PREFIX[:1],
+    )
+    if removed:
+        logger.info(f"pruned {len(removed)} old background music upload(s)")
+
+
 def save_bgm_upload(filename: str, source: BinaryIO) -> str:
     """
     以分块、限量和原子替换的方式保存用户背景音乐。
@@ -305,6 +333,7 @@ def save_bgm_upload(filename: str, source: BinaryIO) -> str:
 
     try:
         _validate_audio(temp_path)
+        _prune_uploaded_bgm(os.path.dirname(temp_path))
         try:
             os.replace(temp_path, target_path)
         except OSError as exc:

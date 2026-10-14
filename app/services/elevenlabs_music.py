@@ -11,6 +11,7 @@ from loguru import logger
 from app.config import config
 from app.services import bgm as bgm_service
 from app.utils import utils
+from app.utils.download_deadline import DownloadDeadline, DownloadDeadlineExceeded
 
 
 DEFAULT_BASE_URL = "https://api.elevenlabs.io"
@@ -287,8 +288,13 @@ def _create_video_proxy(video_path: str) -> str:
 def _stream_audio(response: requests.Response, temp_audio_path: str) -> int:
     """分块保存音频并限制最大体积，防止异常响应耗尽本机磁盘。"""
     total_bytes = 0
+    deadline = DownloadDeadline()
     with open(temp_audio_path, "wb") as output:
         for chunk in response.iter_content(chunk_size=1024 * 1024):
+            try:
+                deadline.check("ElevenLabs audio download")
+            except DownloadDeadlineExceeded as exc:
+                raise ElevenLabsMusicError(str(exc)) from exc
             if not chunk:
                 continue
             total_bytes += len(chunk)

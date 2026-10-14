@@ -20,6 +20,8 @@ from urllib.parse import quote, urlsplit
 import requests
 from loguru import logger
 
+from app.utils.download_deadline import DownloadDeadline, DownloadDeadlineExceeded
+
 
 DEFAULT_RESULT_PORT_NAME = "output"
 DEFAULT_BASE_URL = "https://loomloom.shengsuanyun.com/loom/v1"
@@ -960,7 +962,12 @@ class LoomLoomVideoBackend(LoomLoomScriptBackend):
                 prefix=os.path.basename(destination) + ".", suffix=".part", delete=False,
             ) as output:
                 temporary = output.name
+                deadline = DownloadDeadline()
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    try:
+                        deadline.check("LoomLoom video artifact download")
+                    except DownloadDeadlineExceeded as exc:
+                        raise LoomLoomAPIError(str(exc)) from exc
                     if not chunk:
                         continue
                     downloaded_bytes += len(chunk)

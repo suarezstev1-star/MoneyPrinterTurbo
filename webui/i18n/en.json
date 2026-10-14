@@ -601,6 +601,14 @@
     "kimi_code.oauth.region_mismatch": "Signed in for region \"{authorized}\", but the selected API Platform is \"{selected}\". Requests will use \"{authorized}\" to match your credential; sign in again to switch regions.",
     "kimi_code.oauth.network_error": "Could not reach the Kimi authorization service (network error). Check your connection, then start sign-in again.",
     "kimi_code.oauth.changed": "Sign-in state changed in another page. This authorization has stopped; sign in again if needed.",
-    "kimi_code.oauth.poll_retry": "Network error while checking the authorization status; retrying automatically…"
+    "kimi_code.oauth.poll_retry": "Network error while checking the authorization status; retrying automatically…",
+    "Access Password": "Access password",
+    "Unlock": "Unlock",
+    "Access Password Prompt": "This WebUI is protected. Enter the access password to continue.",
+    "Access Password Incorrect": "Incorrect password.",
+    "Unauthenticated Banner": "Settings, key export/import and provider sign-in are disabled because this WebUI is reachable from other hosts and has no password. Set the MPT_WEBUI_PASSWORD environment variable (or app.webui_password in config.toml) and restart to enable them. If the port is only exposed to localhost, set MPT_WEBUI_ALLOW_UNAUTHENTICATED=1 instead.",
+    "Settings Locked": "Settings are locked until an access password is set.",
+    "Session Task Limit Reached": "This session already has {limit} queued or running tasks. Wait for one to finish before starting another.",
+    "Read Only In WebUI": "Read-only here. Edit this value in config.toml."
   }
 }

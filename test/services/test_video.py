@@ -81,6 +81,9 @@ class _FakeMoviePyClip:
 class TestVideoService(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
+        # Default crossfades overlap neighbouring clips; these tests pin the
+        # clip-coverage arithmetic of hard cuts.
+        config.app["video_crossfade_seconds"] = 0
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()

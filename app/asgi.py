@@ -1,5 +1,6 @@
 """Application implementation - ASGI."""
 
+import ipaddress
 import math
 import os
 from contextlib import asynccontextmanager
@@ -14,9 +15,11 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from app.config import config
-from app.controllers import base
+from app.controllers import base, rate_limit
 from app.models.exception import HttpException
 from app.router import root_api_router
+from app.services import bgm as bgm_service
+from app.services import material_upload as material_upload_service
 from app.utils import utils
 
 
@@ -43,6 +46,8 @@ async def application_lifespan(_: FastAPI):
     from app.services import task as task_service
 
     task_service.recover_interrupted_cross_posts()
+    # 同理，执行进程已退出的视频任务也不会继续运行，需要在恢复队列前收敛。
+    task_service.recover_interrupted_tasks()
 
     # Redis queue entries persist across API restarts. No task_done callback
     # exists in the new process to dispatch them, so fill its worker slots now.
@@ -251,6 +256,218 @@ def configure_browser_access(instance: FastAPI, allowed_origins: list[str]) -> N
     configure_cors(instance, allowed_origins)
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "testserver"})
+_LOOPBACK_LISTEN_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_without_port(raw_host: str) -> str:
+    """Return the lower-case host part of a Host header (IPv6 aware)."""
+    host = raw_host.strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else host
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".")
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _configured_allowed_hosts() -> list[str] | None:
+    raw = config.app.get("allowed_hosts", None)
+    if raw in (None, "", []):
+        return None
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        return None
+    hosts = [str(item).strip().lower() for item in raw if str(item).strip()]
+    return hosts or None
+
+
+def is_host_allowed(raw_host: str | None) -> bool:
+    """Reject Host headers that are not this server (DNS-rebinding defence).
+
+    A rebinding page makes the browser send an attacker-chosen *name* in Host,
+    so IP literals and the explicit allow-list are accepted while unknown names
+    are not. With an API key and a non-loopback listen address the key already
+    protects the API, so names are allowed unless ``app.allowed_hosts`` is set.
+    """
+    if not raw_host:
+        return False
+    host = _host_without_port(raw_host)
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS or _is_ip_literal(host):
+        return True
+    own_hostname = str(getattr(config, "hostname", "") or "").lower()
+    if own_hostname and host == own_hostname:
+        return True
+
+    configured = _configured_allowed_hosts()
+    if configured is not None:
+        for pattern in configured:
+            if pattern == "*" or host == pattern:
+                return True
+            if pattern.startswith("*.") and host.endswith(pattern[1:]):
+                return True
+        return False
+
+    listen_host = str(getattr(config, "listen_host", "") or "").lower()
+    api_key = config.app.get("api_key", "")
+    return bool(api_key) and listen_host not in _LOOPBACK_LISTEN_HOSTS
+
+
+class TrustedHostMiddleware:
+    """Validate the Host header with IPv6 support and a configurable list."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            raw_host = None
+            for name, value in scope.get("headers", []):
+                if name == b"host":
+                    raw_host = value.decode("latin-1")
+                    break
+            if not is_host_allowed(raw_host):
+                logger.warning(
+                    f"blocked untrusted Host header: path={scope.get('path')}, "
+                    f"host={raw_host!r}"
+                )
+                if scope["type"] == "http":
+                    response = JSONResponse(
+                        status_code=400,
+                        content=utils.get_response(
+                            status=400, message="invalid host header"
+                        ),
+                    )
+                    await response(scope, receive, send)
+                else:
+                    await send({"type": "websocket.close", "code": 1008})
+                return
+        await self.app(scope, receive, send)
+
+
+_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+_DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+def _body_limit_for(scope) -> int | None:
+    if scope.get("method") not in ("POST", "PUT", "PATCH"):
+        return None
+    path = scope.get("path", "").rstrip("/")
+    if not path.startswith("/api/v1"):
+        return None
+    if path == "/api/v1/musics":
+        return bgm_service.MAX_BGM_UPLOAD_BYTES + _MULTIPART_OVERHEAD_BYTES
+    if path == "/api/v1/video_materials":
+        return (
+            max(
+                material_upload_service.MAX_VIDEO_MATERIAL_UPLOAD_BYTES,
+                material_upload_service.MAX_IMAGE_MATERIAL_UPLOAD_BYTES,
+            )
+            + _MULTIPART_OVERHEAD_BYTES
+        )
+    configured = config.app.get("max_request_body_bytes", _DEFAULT_MAX_BODY_BYTES)
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        return _DEFAULT_MAX_BODY_BYTES
+    return configured if configured > 0 else None
+
+
+class RequestBodyLimitMiddleware:
+    """Cap request bodies before Starlette spools multipart uploads to disk.
+
+    A declared Content-Length over the cap is rejected immediately with 413;
+    chunked or understated bodies are counted while they are read.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        limit = _body_limit_for(scope) if scope["type"] == "http" else None
+        if limit is None:
+            await self.app(scope, receive, send)
+            return
+
+        too_large = JSONResponse(
+            status_code=413,
+            content=utils.get_response(
+                status=413, message="request body is too large"
+            ),
+        )
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = 0
+                if declared > limit:
+                    await too_large(scope, receive, send)
+                    return
+                break
+
+        received = 0
+        exceeded = False
+
+        async def limited_receive():
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise _BodyTooLarge()
+            return message
+
+        async def guarded_send(message):
+            # Framework layers (e.g. FastAPI body parsing) may translate the
+            # read failure into their own 400/500. Once the cap is hit only
+            # the 413 below may reach the client.
+            if not exceeded:
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except Exception:
+            if not exceeded:
+                raise
+        if exceeded:
+            await too_large(scope, receive, send)
+
+
+def configure_request_guards(instance: FastAPI) -> None:
+    """Rate limiting, body-size cap and Host validation for the API."""
+
+    @instance.middleware("http")
+    async def throttle_api_posts(request: Request, call_next):
+        if request.method == "POST" and request.url.path.startswith("/api/v1/"):
+            if not rate_limit.allow_request(base.rate_limit_client(request)):
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": "60"},
+                    content=utils.get_response(
+                        status=429, message="too many requests, retry later"
+                    ),
+                )
+        return await call_next(request)
+
+    instance.add_middleware(RequestBodyLimitMiddleware)
+    instance.add_middleware(TrustedHostMiddleware)
+
+
 def get_application() -> FastAPI:
     """Initialize FastAPI application.
 
@@ -268,10 +485,16 @@ def get_application() -> FastAPI:
     instance.include_router(root_api_router)
     instance.add_exception_handler(HttpException, exception_handler)
     instance.add_exception_handler(RequestValidationError, validation_exception_handler)
+    configure_request_guards(instance)
     return instance
 
 
 app = get_application()
+
+
+_PROTECTED_DOC_PATHS = frozenset(
+    {"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
+)
 
 
 @app.middleware("http")
@@ -285,7 +508,10 @@ async def protect_generated_task_files(request: Request, call_next):
 
     request_path = request.url.path
     is_task_file = request_path == "/tasks" or request_path.startswith("/tasks/")
-    if is_task_file and request.method != "OPTIONS":
+    # The interactive docs and schema describe every endpoint; require the key
+    # for them too. /ping stays open for health checks.
+    is_docs = request_path in _PROTECTED_DOC_PATHS
+    if (is_task_file or is_docs) and request.method != "OPTIONS":
         try:
             base.verify_token(request)
         except HttpException as exception:

@@ -18,6 +18,7 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
+    cache_manager,
     elevenlabs_music,
     llm,
     loomloom,
@@ -66,6 +67,9 @@ _LOOMLOOM_STATE_WRITE_ATTEMPTS = 3
 _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
     "cross-posting was interrupted before the process completed"
+)
+_INTERRUPTED_TASK_ERROR = (
+    "video generation was interrupted because the process running it exited"
 )
 # Map upload-post platform ids to the social platform names llm.py accepts.
 _CROSS_POST_SOCIAL_PLATFORMS = {
@@ -283,6 +287,9 @@ def _mark_task_failed(
         "failed_stage": stage,
         "error": message,
     }
+    # 任务已结束，清除执行进程标记，返回值与持久化状态保持一致。
+    if existing_task and existing_task.get("task_owner"):
+        failure["task_owner"] = None
     # 某些外部任务已经创建了可用于恢复或排障的远端 ID。失败状态需要保留
     # 这些非敏感字段，但不能允许调用方覆盖统一的状态、进度和错误结构。
     # Keep completed batch outputs in both the persisted state and the direct
@@ -353,13 +360,17 @@ def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
     if not video_script:
-        video_script = llm.generate_script(
-            video_subject=params.video_subject,
-            language=params.video_language,
-            paragraph_number=params.paragraph_number,
-            video_script_prompt=params.video_script_prompt,
-            custom_system_prompt=params.custom_system_prompt,
-        )
+        try:
+            video_script = llm.generate_script(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+            )
+        except llm.LLMError as exc:
+            _mark_task_failed(task_id, "script", str(exc))
+            return None
     else:
         logger.debug(f"video script: \n{video_script}")
 
@@ -377,12 +388,16 @@ def generate_terms(task_id, params, video_script):
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
-        )
+        try:
+            video_terms = llm.generate_terms(
+                video_subject=params.video_subject,
+                video_script=utils.remove_pause_tags(video_script),
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+            )
+        except llm.LLMError as exc:
+            _mark_task_failed(task_id, "terms", str(exc))
+            return None
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
@@ -640,16 +655,24 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
-def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
+def generate_subtitle(task_id, params, video_script, sub_maker, audio_file, warnings=None):
     """
     Generate subtitle for the video script.
     If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
     Otherwise, it will generate the subtitle using the specified provider.
+    When ``warnings`` is a list, user-visible entries are appended to it:
+    ``subtitles_skipped`` (requested but none produced) and ``subtitles_partial``
+    (some script lines could not be timed).
     Returns:
         - subtitle_path: path to the generated subtitle file
     """
     logger.info("\n\n## generating subtitle")
     if not params.subtitle_enabled:
+        return ""
+
+    def _skipped(reason):
+        if warnings is not None:
+            warnings.append({"code": "subtitles_skipped", "reason": reason})
         return ""
 
     final_subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
@@ -668,20 +691,22 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             "subtitle maker is missing, skip subtitle generation for provider: "
             f"{subtitle_provider}"
         )
-        return ""
+        return _skipped("no_timing_source")
 
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
 
     # A failed retry must never reuse captions from an earlier narration.
     with staged_subtitle_file(final_subtitle_path) as subtitle_path:
         if subtitle_provider == "edge":
-            voice.create_subtitle(
+            outcome = voice.create_subtitle(
                 text=video_script,
                 sub_maker=sub_maker,
                 subtitle_file=subtitle_path,
                 word_level=is_word_level,
             )
-            if not os.path.exists(subtitle_path):
+            # The staged file is created empty by mkstemp, so existence says
+            # nothing; only parseable cues count as produced subtitles.
+            if not subtitle.file_to_subtitles(subtitle_path):
                 # Edge 字幕偶尔会因为时间轴与文案无法匹配而没有产出文件。这里不能
                 # 自动切换到 Whisper，否则首次失败会在用户不知情的情况下下载数 GB
                 # 的模型。只有显式配置 Whisper 时才允许加载模型，Edge 失败则保留
@@ -690,7 +715,17 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                     "edge subtitle generation did not produce a subtitle file; "
                     "skip subtitles without falling back to whisper"
                 )
-                return ""
+                return _skipped("no_matching_lines")
+            if (
+                isinstance(outcome, dict)
+                and warnings is not None
+                and outcome.get("matched", 0) < outcome.get("total", 0)
+            ):
+                warnings.append({
+                    "code": "subtitles_partial",
+                    "matched": outcome["matched"],
+                    "total": outcome["total"],
+                })
 
         if subtitle_provider == "whisper":
             subtitle.create(
@@ -700,7 +735,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             )
             if not subtitle.file_to_subtitles(subtitle_path):
                 logger.warning("whisper produced no usable subtitle cues")
-                return ""
+                return _skipped("no_transcription")
             if not is_word_level:
                 logger.info("\n\n## correcting subtitle")
                 subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
@@ -708,7 +743,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
         if not subtitle_lines:
             logger.warning(f"subtitle file is invalid: {subtitle_path}")
-            return ""
+            return _skipped("invalid_subtitle_file")
 
         os.replace(subtitle_path, final_subtitle_path)
         return final_subtitle_path
@@ -720,7 +755,15 @@ def get_video_materials(
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    video_script=None,
+    warnings=None,
 ):
+    # Rate-limited (once an hour) cleanup of stale temp files and old cache.
+    try:
+        cache_manager.sweep()
+    except Exception as exc:
+        logger.warning(f"video cache sweep failed: {type(exc).__name__}: {exc}")
+
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -797,6 +840,18 @@ def get_video_materials(
             return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        # Sentence-aligned stock selection: only for a single video, because
+        # batch allocation splits one shared pool across several videos.
+        sentence_plan = None
+        if (
+            params.video_source in material.STOCK_SOURCES
+            and getattr(params, "video_count", 1) == 1
+            and video_script
+            and material.sentence_alignment_enabled(
+                getattr(params, "match_materials_to_script", False)
+            )
+        ):
+            sentence_plan = material.plan_sentence_queries(video_script)
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         try:
@@ -816,6 +871,8 @@ def get_video_materials(
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                warnings=warnings,
+                sentence_plan=sentence_plan,
             )
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
@@ -899,6 +956,13 @@ def get_video_materials(
                 f"failed to download video materials from {params.video_source}",
             )
             return None
+        if sentence_plan and any(entry.get("aligned") for entry in sentence_plan):
+            # Clips are already in narrative order; a random shuffle in the
+            # editor would destroy the sentence alignment.
+            try:
+                params.match_materials_to_script = True
+            except Exception as exc:
+                logger.warning(f"could not pin sequential concat: {exc}")
         return downloaded_videos
 
 
@@ -1000,7 +1064,11 @@ def generate_final_videos(
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
     # Matching preserves keyword order; batch allocation varies each keyword's candidates.
-    if params.match_materials_to_script:
+    # Sentence-aligned footage is already in narrative order, so shuffling it
+    # again at render time would undo the alignment.
+    if params.match_materials_to_script or (
+        params.video_count == 1 and task_artifacts.has_sentence_alignment(task_id)
+    ):
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
@@ -1029,6 +1097,7 @@ def generate_final_videos(
         # 每条视频占 50% 进度中的一份，合成与最终编码各占一半。片段处理是
         # 合成里最耗时的部分，逐段推进这一半的进度。
         combine_share = 50 / params.video_count / 2
+        render_warnings = []
         video.combine_videos(
             combined_video_path=combined_video_path,
             video_paths=downloaded_videos,
@@ -1043,6 +1112,7 @@ def generate_final_videos(
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
+            warnings=render_warnings,
             **batch_options,
         )
         if allocate_batch_materials:
@@ -1109,7 +1179,9 @@ def generate_final_videos(
             output_file=final_video_path,
             params=params,
             bgm_file_override=bgm_file_override,
+            warnings=render_warnings,
         )
+        warnings.extend({**item, "video_index": index} for item in render_warnings)
         if (
             video_music_provider is not None
             and bgm_file_override
@@ -1244,6 +1316,55 @@ def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
 
     if recovered:
         logger.warning(f"recovered interrupted cross-post tasks: {recovered}")
+    return recovered
+
+
+def recover_interrupted_tasks(page_size: int = 100) -> int | None:
+    """
+    将执行进程已退出、却仍停留在 processing 的视频任务标记为失败。
+
+    流水线在当前进程的线程中运行，进程重启后不会继续执行；残留的 processing
+    状态会让任务永久无法删除。只处理带 task_owner 的记录：排队中的任务和
+    旧版本创建的任务没有 owner，无法判断归属，保持原状。其它主机或仍存活
+    进程（例如同时运行的 WebUI）持有的任务同样不能被误伤。
+    """
+    recovered = 0
+    try:
+        task_ids = sm.state.list_task_ids(scan_count=page_size)
+        for task_id in task_ids:
+            task = sm.state.get_task(task_id)
+            if not task:
+                continue
+            state = task.get("state")
+            try:
+                state = int(state)
+            except (TypeError, ValueError):
+                pass
+            owner = task.get("task_owner")
+            if (
+                state != const.TASK_STATE_PROCESSING
+                or not owner
+                or owner == _cross_post_process_owner
+                or _is_cross_post_owner_alive(owner)
+            ):
+                continue
+
+            # patch_task 只更新仍存在的记录，扫描后被用户删除的任务不会被重建。
+            updated = sm.state.patch_task(
+                task_id,
+                state=const.TASK_STATE_FAILED,
+                failed_stage="interrupted",
+                error=_INTERRUPTED_TASK_ERROR,
+                task_owner=None,
+            )
+            if updated:
+                recovered += 1
+    except Exception as exc:
+        logger.exception(f"failed to recover interrupted tasks: {exc}")
+        return None
+
+    if recovered:
+        logger.warning(f"recovered interrupted video tasks: {recovered}")
     return recovered
 
 
@@ -1519,10 +1640,13 @@ def _run_pipeline(
     voxcpm_prompt_text: str = "",
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
+    # task_owner 记录执行流水线的进程，进程退出后启动恢复据此把遗留的
+    # processing 状态收敛为失败；排队中的任务尚无 owner，不会被误判。
     sm.state.update_task(
         task_id, state=const.TASK_STATE_PROCESSING, progress=5,
         failed_stage=None, error=None,
         videos=[], combined_videos=[], warnings=None, failed_video_index=None,
+        task_owner=_cross_post_process_owner,
     )
 
     if stop_at == "video" and params.subtitle_enabled:
@@ -1748,8 +1872,10 @@ def _run_pipeline(
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
+    subtitle_warnings = []
     subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
+        task_id, params, video_script, sub_maker, audio_file,
+        warnings=subtitle_warnings,
     )
 
     if stop_at == "subtitle":
@@ -1764,18 +1890,25 @@ def _run_pipeline(
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             subtitle_path=subtitle_path,
+            warnings=subtitle_warnings or None,
         )
-        return {"subtitle_path": subtitle_path}
+        stage_result = {"subtitle_path": subtitle_path}
+        if subtitle_warnings:
+            stage_result["warnings"] = subtitle_warnings
+        return stage_result
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    material_warnings: list = []
     downloaded_videos = get_video_materials(
         task_id,
         params,
         video_terms,
         audio_duration,
         loomloom_video_request=loomloom_video_request,
+        video_script=video_script,
+        warnings=material_warnings,
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1790,6 +1923,7 @@ def _run_pipeline(
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             materials=downloaded_videos,
+            warnings=material_warnings or None,
         )
         return {"materials": downloaded_videos}
 
@@ -1830,6 +1964,8 @@ def _run_pipeline(
             "video",
             "failed to generate final video",
         )
+    if material_warnings:
+        generation_warnings = material_warnings + list(generation_warnings or [])
 
     logger.success(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
@@ -1840,6 +1976,9 @@ def _run_pipeline(
     cross_post_enabled = (
         upload_post.upload_post_service.is_configured()
         and upload_post.upload_post_service.auto_upload
+        # API-created tasks default to cross_post=False (explicit opt-in);
+        # WebUI/CLI params keep the configured auto-upload behavior.
+        and getattr(params, "cross_post", True) is not False
     )
     platforms = (
         list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
@@ -1864,7 +2003,7 @@ def _run_pipeline(
         "cross_post_results": None,
         "cross_post_error": None,
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
-        "warnings": generation_warnings or None,
+        "warnings": (subtitle_warnings + list(generation_warnings or [])) or None,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
