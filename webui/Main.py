@@ -4658,10 +4658,13 @@ def _render_local_script_generation(params):
             )
             return script, terms
 
-        script, terms = _run_llm_read_operation(
-            "generate_script_and_terms",
-            generate_script_and_terms,
-        )
+        try:
+            script, terms = _run_llm_read_operation(
+                "generate_script_and_terms",
+                generate_script_and_terms,
+            )
+        except llm.LLMError as exc:
+            script, terms = f"Error: {exc}", []
         if "Error: " in script:
             st.error(tr(script))
         elif "Error: " in terms:
@@ -5150,16 +5153,19 @@ def _render_script_settings(panel, params):
                     st.warning(tr("Please Enter the Video Subject"))
                 else:
                     with st.spinner(tr("Generating Video Keywords")):
-                        terms = _run_llm_read_operation(
-                            "generate_terms",
-                            lambda app_config_snapshot: llm.generate_terms(
-                                params.video_subject,
-                                params.video_script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
-                                app_config=app_config_snapshot,
-                            ),
-                        )
+                        try:
+                            terms = _run_llm_read_operation(
+                                "generate_terms",
+                                lambda app_config_snapshot: llm.generate_terms(
+                                    params.video_subject,
+                                    params.video_script,
+                                    amount=8 if params.match_materials_to_script else 5,
+                                    match_script_order=params.match_materials_to_script,
+                                    app_config=app_config_snapshot,
+                                ),
+                            )
+                        except llm.LLMError as exc:
+                            terms = f"Error: {exc}"
                         if "Error: " in terms:
                             st.error(tr(terms))
                         else:

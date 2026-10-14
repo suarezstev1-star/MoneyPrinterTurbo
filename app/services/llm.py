@@ -5,7 +5,9 @@ import os
 import re
 import shutil
 import subprocess
+import random
 import tempfile
+import time
 from time import perf_counter
 from typing import List
 
@@ -18,6 +20,14 @@ from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 from app.utils import utils
 
 _max_retries = 5
+# Pipeline (non-test) requests: bounded per-request timeout, one SDK-level retry.
+# The outer loops add exponential backoff and stop early on config/4xx errors.
+DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 120.0
+PIPELINE_SDK_MAX_RETRIES = 1
+DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS = 1.0
+MAX_LLM_RETRY_DELAY_SECONDS = 30.0
+# Total wall-clock budget for the outer retry loop of one generation call.
+DEFAULT_LLM_TOTAL_BUDGET_SECONDS = 300.0
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -51,20 +61,22 @@ _SENSITIVE_QUERY_RE = re.compile(
 )
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
-# Role: Video Script Generator
+# Role: Short-Form Video Script Writer
 
 ## Goals:
-Generate a script for a video, depending on the subject of the video.
+Write a voiceover script for a short vertical video about the given subject. The script is read aloud by a text-to-speech voice over stock footage, so every sentence must be easy to hear and easy to picture.
 
-## Constrains:
-1. the script is to be returned as a string with the specified number of paragraphs.
-2. do not under any circumstance reference this prompt in your response.
-3. get straight to the point, don't start with unnecessary things like, "welcome to this video".
-4. you must not include any type of markdown or formatting in the script, never use a title.
-5. only return the raw content of the script.
-6. do not include "voiceover", "narrator" or similar indicators of what should be spoken at the beginning of each paragraph or line.
-7. you must not mention the prompt, or anything about the script itself. also, never talk about the amount of paragraphs or lines. just write the script.
-8. respond in the same language as the video subject.
+## Constraints:
+1. HOOK: the very first sentence (the first 3 seconds) must stop the scroll with a surprising fact, a bold claim, a vivid question or a tension. Never open with greetings, "welcome", "in this video", or a restatement of the subject.
+2. STRUCTURE: hook, then the body in a logical order, then a payoff ending that lands the main takeaway or ends with one short call to action (follow, save, try it, think about it). The last line must feel finished.
+3. SENTENCES: short spoken sentences, ideally 6 to 14 words (or about 10 to 25 characters for Chinese, Japanese and Korean). Plain, concrete, conversational words. No filler, no hedging, no long subordinate clauses.
+4. ONE IDEA PER SENTENCE, preferably something that can be shown on screen (an object, place, action or person). Each sentence will later be matched to its own piece of footage.
+5. Be specific: use real details, numbers and examples rather than vague generalities. Do not invent statistics you are unsure of.
+6. LENGTH: follow the target length given under Initialization. Do not pad and do not stop early.
+7. FORMAT: plain prose only. No markdown, no headings or title, no bullet points, no emojis, no hashtags, no stage directions, no camera or scene notes, no text in brackets or parentheses, and no "voiceover" or "narrator" labels. Separate paragraphs with a blank line.
+8. do not under any circumstance reference this prompt, the script itself, the number of paragraphs or lines, or the word count. Just write the script.
+9. respond in the same language as the video subject.
+10. only return the raw content of the script.
 """.strip()
 
 # Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
@@ -217,6 +229,160 @@ def _sanitize_error_message(error: object) -> str:
     return message
 
 
+_SECRET_TOKEN_RES = (
+    re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{8,}", re.IGNORECASE),
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}"),
+    re.compile(
+        r"""(?i)\b(api[_-]?key|token|secret|authorization)(["']?\s*[:=]\s*["']?)"""
+        r"""[A-Za-z0-9._\-]{8,}"""
+    ),
+)
+_MAX_LLM_ERROR_LENGTH = 500
+
+
+def _redact_secrets(text: str) -> str:
+    """Mask API keys, bearer tokens and URL credentials in an error message."""
+    text = _sanitize_error_message(text)
+    text = _SECRET_TOKEN_RES[0].sub("Bearer ***", text)
+    text = _SECRET_TOKEN_RES[1].sub("***", text)
+    text = _SECRET_TOKEN_RES[2].sub("***", text)
+    text = _SECRET_TOKEN_RES[3].sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+    return text
+
+
+# Failures that retrying cannot fix: bad credentials, wrong model/endpoint,
+# exhausted quota or missing configuration. Matched case-insensitively against
+# the provider error text (the adapters flatten exceptions to "Error: ...").
+_NON_RETRYABLE_MARKERS = (
+    "is not set, please set it",
+    "unsupported llm provider",
+    "claude cli not found",
+    "error code: 400",
+    "error code: 401",
+    "error code: 403",
+    "error code: 404",
+    "status code: 400",
+    "status code: 401",
+    "status code: 403",
+    "status code: 404",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "api key not valid",
+    "api key is invalid",
+    "authentication",
+    "unauthorized",
+    "permission denied",
+    "permissiondenied",
+    "forbidden",
+    "model not found",
+    "model_not_found",
+    "does not exist",
+    "no such model",
+    "unknown model",
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "quota exceeded",
+    "quota has been",
+    "billing",
+    "account is not active",
+    "arrearage",
+    "当日额度已消耗完",
+)
+# Transient conditions win over the markers above (e.g. a plain 429 rate limit).
+_RETRYABLE_MARKERS = (
+    "rate limit",
+    "rate_limit",
+    "error code: 429",
+    "error code: 500",
+    "error code: 502",
+    "error code: 503",
+    "error code: 504",
+    "overloaded",
+    "timed out",
+    "timeout",
+    "connection error",
+    "temporarily",
+)
+_PERMANENT_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "quota exceeded",
+    "exceeded your current quota",
+)
+
+
+class LLMError(RuntimeError):
+    """A language-model call failed; ``str(error)`` is the cleaned real reason.
+
+    The message has the internal ``Error: `` sentinel removed and credentials
+    redacted, so it is safe to show in the WebUI, API responses and task state.
+    ``retryable`` is False for configuration/auth/quota failures.
+    """
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def is_non_retryable_llm_error(message: str) -> bool:
+    """True when retrying the same request cannot succeed (auth, 4xx, quota)."""
+    normalized = (message or "").lower()
+    if any(marker in normalized for marker in _RETRYABLE_MARKERS):
+        return any(marker in normalized for marker in _PERMANENT_QUOTA_MARKERS)
+    return any(marker in normalized for marker in _NON_RETRYABLE_MARKERS)
+
+
+def _llm_error_from_response(response: str) -> LLMError:
+    """Build an LLMError from an ``Error: ...`` sentinel returned by the adapters."""
+    message = _redact_secrets(str(response)).removeprefix("Error:").strip()
+    message = message[:_MAX_LLM_ERROR_LENGTH] or "LLM request failed"
+    return LLMError(message, retryable=not is_non_retryable_llm_error(message))
+
+
+def _config_float(app_config, key: str, default: float) -> float:
+    source = app_config if app_config is not None else config.app
+    try:
+        value = float(source.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _resolve_request_timeout(app_config=None) -> float:
+    return _config_float(
+        app_config, "llm_request_timeout", DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
+    )
+
+
+def _retry_delay(attempt: int, app_config=None) -> float:
+    """Exponential backoff with jitter before outer attempt ``attempt + 1``."""
+    base = _config_float(
+        app_config, "llm_retry_base_delay", DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS
+    )
+    delay = min(MAX_LLM_RETRY_DELAY_SECONDS, base * (2**attempt))
+    return delay * random.uniform(0.5, 1.0)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _wait_before_retry(attempt: int, started_at: float, app_config=None) -> bool:
+    """Sleep with backoff; return False when the total retry budget is spent."""
+    budget = _config_float(
+        app_config, "llm_total_budget", DEFAULT_LLM_TOTAL_BUDGET_SECONDS
+    )
+    delay = _retry_delay(attempt, app_config)
+    if perf_counter() - started_at + delay > budget:
+        return False
+    if delay > 0:
+        _sleep(delay)
+    return True
+
+
 def _extract_chat_completion_text(response, llm_provider: str) -> str:
     # OpenAI 兼容接口在异常场景下，可能返回没有 choices、
     # 或者 choices/message/content 为空的响应对象。
@@ -318,6 +484,12 @@ def _generate_response(
         # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
         # 而切换到另一个 Provider、Base URL 或模型。
         runtime_app_config = app_config if app_config is not None else config.app
+        # Pipeline calls get a bounded timeout and a single SDK retry instead of
+        # the SDK defaults (600s, 2 retries); the connection test passes its own.
+        if request_timeout is None:
+            request_timeout = _resolve_request_timeout(runtime_app_config)
+        if max_retries is None:
+            max_retries = PIPELINE_SDK_MAX_RETRIES
         llm_provider = str(
             runtime_app_config.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
         ).lower()
@@ -396,6 +568,7 @@ def _generate_response(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 api_key=api_key,
+                request_timeout=request_timeout,
             )
             if response:
                 if isinstance(response, GenerationResponse):
@@ -417,7 +590,10 @@ def _generate_response(
             from google import genai
             from google.genai import types
 
-            http_options = types.HttpOptions(base_url=base_url) if base_url else None
+            # google-genai takes the HTTP timeout in milliseconds.
+            http_options = types.HttpOptions(
+                base_url=base_url or None, timeout=int(request_timeout * 1000)
+            )
             generation_config = types.GenerateContentConfig(
                 temperature=0.5,
                 top_p=1,
@@ -494,6 +670,8 @@ def _generate_response(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 drop_params=True,
+                timeout=request_timeout,
+                num_retries=max_retries,
             )
 
             if not response:
@@ -841,14 +1019,73 @@ def _normalize_script_paragraph_number(paragraph_number: int | None) -> int:
     return value
 
 
+# Spoken-pace model used to turn a desired duration into a length target.
+SCRIPT_SECONDS_PER_PARAGRAPH = 20
+SCRIPT_WORDS_PER_SECOND = 2.5
+SCRIPT_CJK_CHARS_PER_SECOND = 4.0
+MIN_SCRIPT_TARGET_SECONDS = 10
+MAX_SCRIPT_TARGET_SECONDS = 600
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+_CJK_LANGUAGE_PREFIXES = ("zh", "ja", "ko", "chinese", "japanese", "korean")
+
+
+def _is_cjk_script(language: str = "", video_subject: str = "") -> bool:
+    """CJK scripts are measured in characters, everything else in words."""
+    lang = (language or "").strip().lower()
+    if lang:
+        if lang.startswith(_CJK_LANGUAGE_PREFIXES):
+            return True
+        if lang != "auto":
+            return False
+    subject = video_subject or ""
+    cjk_chars = len(_CJK_RE.findall(subject))
+    return cjk_chars > 0 and cjk_chars >= len(subject.strip()) / 3
+
+
+def resolve_script_target_duration(
+    paragraph_number: int = 1, target_duration_seconds: float | None = None
+) -> int:
+    """Desired spoken duration in seconds (explicit value, else inferred)."""
+    try:
+        explicit = float(target_duration_seconds) if target_duration_seconds else 0
+    except (TypeError, ValueError):
+        explicit = 0
+    if explicit > 0 and math.isfinite(explicit):
+        seconds = explicit
+    else:
+        seconds = _normalize_script_paragraph_number(paragraph_number) * (
+            SCRIPT_SECONDS_PER_PARAGRAPH
+        )
+    return int(max(MIN_SCRIPT_TARGET_SECONDS, min(seconds, MAX_SCRIPT_TARGET_SECONDS)))
+
+
+def estimate_script_length(
+    duration_seconds: float, language: str = "", video_subject: str = ""
+) -> tuple[int, int, str]:
+    """Return ``(low, high, unit)`` for a spoken script of the given duration.
+
+    About 2.5 words per second for alphabetic languages and about 4 characters
+    per second for Chinese, Japanese and Korean; the range is +/-10%.
+    """
+    if _is_cjk_script(language, video_subject):
+        unit, rate = "characters", SCRIPT_CJK_CHARS_PER_SECOND
+    else:
+        unit, rate = "words", SCRIPT_WORDS_PER_SECOND
+    total = duration_seconds * rate
+    return int(round(total * 0.9)), int(round(total * 1.1)), unit
+
+
 def build_script_prompt(
     video_subject: str,
     language: str = "",
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    target_duration_seconds: float | None = None,
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
+    duration = resolve_script_target_duration(paragraph_number, target_duration_seconds)
+    low, high, unit = estimate_script_length(duration, language, video_subject)
     video_script_prompt = _limit_script_text(
         video_script_prompt, MAX_SCRIPT_PROMPT_LENGTH, "video_script_prompt"
     )
@@ -864,6 +1101,8 @@ def build_script_prompt(
 # Initialization:
 - video subject: {video_subject}
 - number of paragraphs: {paragraph_number}
+- target duration when read aloud: about {duration} seconds
+- target length: {low} to {high} {unit} in total
 """.rstrip()
     if language:
         prompt += f"\n- language: {language}"
@@ -884,7 +1123,14 @@ def generate_script(
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
     app_config=None,
+    target_duration_seconds: float | None = None,
 ) -> str:
+    """Generate a narration script.
+
+    Raises ``LLMError`` (cleaned, secret-redacted real reason) when the provider
+    fails, e.g. invalid API key or exhausted quota. Returns ``""`` only when the
+    model answered but produced no usable text after all attempts.
+    """
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
         video_script_prompt, MAX_SCRIPT_PROMPT_LENGTH, "video_script_prompt"
@@ -898,6 +1144,7 @@ def generate_script(
         paragraph_number=paragraph_number,
         video_script_prompt=video_script_prompt,
         custom_system_prompt=custom_system_prompt,
+        target_duration_seconds=target_duration_seconds,
     )
     final_script = ""
     logger.info(
@@ -941,36 +1188,48 @@ def generate_script(
         # Join the selected paragraphs into a single string
         return "\n\n".join(paragraphs)
 
+    last_error = None
+    started_at = perf_counter()
     for i in range(_max_retries):
+        last_error = None
+        candidate = ""
         try:
             if app_config is None:
                 response = _generate_response(prompt=prompt)
             else:
                 response = _generate_response(prompt=prompt, app_config=app_config)
             if isinstance(response, str) and response.startswith("Error: "):
-                # _generate_response returns provider failures as text. Passing
-                # that text through would make the task treat it as narration.
-                raise ValueError(response)
-            if response:
+                # _generate_response returns provider failures as text. Keep the
+                # real reason instead of passing it through as narration.
+                last_error = _llm_error_from_response(response)
+            elif response:
                 candidate = format_response(response).strip()
+                # Some upstream providers return quota errors as plain text.
+                if candidate and "当日额度已消耗完" in candidate:
+                    last_error = _llm_error_from_response(candidate)
+                    candidate = ""
             else:
                 logging.error("gpt returned an empty response")
-                candidate = ""
-
-            # Some upstream providers may return quota errors as plain text.
-            if candidate and "当日额度已消耗完" in candidate:
-                raise ValueError(candidate)
-
-            if candidate:
-                final_script = candidate
-                break
         except Exception as e:
             logger.error(f"failed to generate script: {e}")
+            last_error = LLMError(_redact_secrets(str(e))[:_MAX_LLM_ERROR_LENGTH])
+
+        if candidate:
+            final_script = candidate
+            break
+        if last_error is not None:
+            logger.error(f"failed to generate script: {last_error}")
+            if not last_error.retryable:
+                break
 
         if i < _max_retries - 1:
+            if not _wait_before_retry(i, started_at, app_config):
+                break
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
     if not final_script:
         logger.error("failed to generate video script after retries")
+        if last_error is not None:
+            raise last_error
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
@@ -1013,6 +1272,12 @@ def generate_terms(
     match_script_order: bool = False,
     app_config=None,
 ) -> List[str]:
+    """Generate stock-footage search terms for the script.
+
+    Raises ``LLMError`` (cleaned, secret-redacted real reason) when the provider
+    fails, e.g. invalid API key or exhausted quota. Returns ``[]`` only when the
+    model answered but produced no usable terms after all attempts.
+    """
     video_script = utils.remove_pause_tags(video_script or "").strip()
     if match_script_order:
         goal = (
@@ -1020,7 +1285,7 @@ def generate_terms(
             "the order of topics in the video script."
         )
         ordering_rule = (
-            "6. keep the terms in the same order as the script narration; "
+            "8. keep the terms in the same order as the script narration; "
             "earlier terms must describe earlier visual moments."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
@@ -1043,17 +1308,19 @@ def generate_terms(
         )
 
     prompt = f"""
-# Role: Video Search Terms Generator
+# Role: Stock Footage Search Terms Generator
 
 ## Goals:
 {goal}
 
-## Constrains:
+## Constraints:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
-3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+2. each search term is 2-4 english words describing something a camera can film: a concrete subject plus a visible action, object or setting (e.g. "chef slicing tomatoes", "aerial city skyline", "runner crossing finish line").
+3. avoid abstract nouns and concepts (e.g. "success", "motivation", "innovation", "freedom"); translate every idea into a visible scene instead.
+4. keep every term tied to the video subject, but vary the shot: mix subjects, locations, actions and camera views, and do not repeat the same wording.
+5. order the terms to follow the narrative of the script from beginning to end.
+6. you must only return the json-array of strings. you must not return anything else. you must not return the script.
+7. reply with english search terms only, even when the script is in another language.
 {ordering_rule}
 
 ## Output Example:
@@ -1073,21 +1340,30 @@ Please note that you must use English for generating video search terms; Chinese
 
     search_terms = []
     response = ""
+    last_error = None
+    started_at = perf_counter()
     for i in range(_max_retries):
         search_terms = []
+        last_error = None
         try:
             if app_config is None:
                 response = _generate_response(prompt)
             else:
                 response = _generate_response(prompt, app_config=app_config)
             if response.startswith("Error: "):
-                # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
-                # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
-                # 素材下载循环还会按字符遍历错误文案，产生无意义的外部请求。
-                # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
-                logger.error(f"failed to generate video terms: {response}")
-                return []
+                # generate_terms 的公开返回类型是 List[str]，不能把错误文案当作
+                # 关键词返回；改为抛出带真实原因的 LLMError，任务编排层据此
+                # 在真实故障位置结束任务。不可重试的错误（密钥、额度）立即停止。
+                last_error = _llm_error_from_response(response)
+                logger.error(f"failed to generate video terms: {last_error}")
+                if not last_error.retryable:
+                    raise last_error
+                response = ""
+                raise last_error
             search_terms = json.loads(_strip_code_fence(response))
+        except LLMError:
+            if last_error is not None and not last_error.retryable:
+                raise
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
             if response:
@@ -1111,10 +1387,118 @@ Please note that you must use English for generating video search terms; Chinese
         if search_terms:
             break
         if i < _max_retries - 1:
+            if not _wait_before_retry(i, started_at, app_config):
+                break
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
+    if not search_terms and last_error is not None:
+        raise last_error
     logger.success(f"completed: \n{search_terms}")
     return search_terms
+
+
+MAX_SENTENCE_QUERY_SENTENCES = 60
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？…])\s*|\n+")
+
+
+def split_script_sentences(script: str) -> List[str]:
+    """Split narration into non-empty sentences (pause tags removed)."""
+    text = utils.remove_pause_tags(script or "")
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+
+
+def _fallback_sentence_query(sentence: str, video_subject: str = "") -> str:
+    words = re.findall(r"[A-Za-z][A-Za-z'-]+", sentence)
+    if len(words) >= 2:
+        return " ".join(words[:4]).lower()
+    return (video_subject or "").strip() or sentence.strip()[:40]
+
+
+def generate_sentence_queries(
+    script: str,
+    video_subject: str = "",
+    fallback_terms: List[str] | None = None,
+    app_config=None,
+) -> List[str]:
+    """Return one concrete visual stock-footage query per script sentence.
+
+    The result is aligned with ``split_script_sentences(script)``: index ``i`` is
+    the 2-4 word English query for sentence ``i``, so a caller can fetch footage
+    per sentence and lay it out in narration order. The function never raises
+    for provider or parse failures. When the model fails, returns the wrong
+    number of items or blank entries, the affected positions fall back to
+    ``fallback_terms`` (spread across the sentences in order, e.g. the output of
+    ``generate_terms``) and finally to a keyword taken from the sentence or the
+    subject. Only the first ``MAX_SENTENCE_QUERY_SENTENCES`` sentences are sent
+    to the model; the rest use the fallback. Returns ``[]`` for an empty script.
+    """
+    sentences = split_script_sentences(script)
+    if not sentences:
+        return []
+    terms = [t.strip() for t in (fallback_terms or []) if isinstance(t, str) and t.strip()]
+    count = len(sentences)
+
+    def fallback_for(index: int, sentence: str) -> str:
+        if terms:
+            return terms[min(len(terms) - 1, index * len(terms) // count)]
+        return _fallback_sentence_query(sentence, video_subject)
+
+    queried = sentences[:MAX_SENTENCE_QUERY_SENTENCES]
+    numbered = "\n".join(f"{n}. {text}" for n, text in enumerate(queried, 1))
+    prompt = f"""
+# Role: Stock Footage Shot Planner
+
+## Goals:
+For each numbered sentence of a video narration, write ONE stock-footage search query that finds a clip illustrating that sentence.
+
+## Constraints:
+1. return a json-array of exactly {len(queried)} strings; item N is the query for sentence N.
+2. each query is 2-4 english words naming something a camera can film: a concrete subject plus a visible action, object or setting.
+3. avoid abstract nouns and concepts; show the idea through a visible scene.
+4. stay faithful to what the sentence says and to the video subject, and vary the shots so neighbouring queries differ.
+5. reply with english only, even when the sentences are in another language.
+6. you must only return the json-array. you must not return anything else.
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Sentences
+{numbered}
+""".strip()
+
+    queries: List[str] = []
+    for attempt in range(2):
+        try:
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if not isinstance(response, str) or response.startswith("Error: "):
+                logger.warning(f"sentence queries unavailable: {response}")
+                if isinstance(response, str) and is_non_retryable_llm_error(response):
+                    break
+                continue
+            try:
+                parsed = json.loads(_strip_code_fence(response))
+            except Exception:
+                parsed = _extract_embedded_json(response, "[")
+            if isinstance(parsed, list) and all(isinstance(q, str) for q in parsed):
+                queries = [q.strip() for q in parsed]
+                if len(queries) == len(queried):
+                    break
+                logger.warning(
+                    f"sentence queries length mismatch: {len(queries)} != {len(queried)}"
+                )
+                queries = []
+        except Exception as e:
+            logger.warning(f"failed to generate sentence queries: {e}")
+
+    return [
+        (queries[index] if index < len(queries) and queries[index] else "")
+        or fallback_for(index, sentence)
+        for index, sentence in enumerate(sentences)
+    ]
 
 
 # =============================================================================

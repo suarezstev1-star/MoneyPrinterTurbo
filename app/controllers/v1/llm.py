@@ -25,13 +25,19 @@ router = new_router(dependencies=[Depends(base.verify_token)])
     summary="Create a script for the video",
 )
 def generate_video_script(request: Request, body: VideoScriptRequest):
-    video_script = llm.generate_script(
-        video_subject=body.video_subject,
-        language=body.video_language,
-        paragraph_number=body.paragraph_number,
-        video_script_prompt=body.video_script_prompt,
-        custom_system_prompt=body.custom_system_prompt,
-    )
+    try:
+        video_script = llm.generate_script(
+            video_subject=body.video_subject,
+            language=body.video_language,
+            paragraph_number=body.paragraph_number,
+            video_script_prompt=body.video_script_prompt,
+            custom_system_prompt=body.custom_system_prompt,
+        )
+    except llm.LLMError as exc:
+        raise HttpException(
+            task_id=base.get_task_id(request), status_code=503,
+            message=f"script generation failed: {exc}",
+        )
     if not video_script or video_script.startswith("Error: "):
         raise HttpException(
             task_id=base.get_task_id(request), status_code=503,
@@ -47,12 +53,18 @@ def generate_video_script(request: Request, body: VideoScriptRequest):
     summary="Generate video terms based on the video script",
 )
 def generate_video_terms(request: Request, body: VideoTermsRequest):
-    video_terms = llm.generate_terms(
-        video_subject=body.video_subject,
-        video_script=body.video_script,
-        amount=body.amount,
-        match_script_order=body.match_materials_to_script,
-    )
+    try:
+        video_terms = llm.generate_terms(
+            video_subject=body.video_subject,
+            video_script=body.video_script,
+            amount=body.amount,
+            match_script_order=body.match_materials_to_script,
+        )
+    except llm.LLMError as exc:
+        raise HttpException(
+            task_id=base.get_task_id(request), status_code=503,
+            message=f"search term generation failed: {exc}",
+        )
     if not video_terms:
         raise HttpException(
             task_id=base.get_task_id(request), status_code=503,

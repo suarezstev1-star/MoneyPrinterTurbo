@@ -60,13 +60,22 @@ def _client(httpx_client=None):
     return TwelveLabs(api_key=api_key, httpx_client=httpx_client)
 
 
+# Text embeddings sit on the interactive terms stage; a slow or unreachable
+# endpoint must fall back to the original term order within seconds instead of
+# stalling the task for minutes (600s timeout x SDK retries x one call per term).
+EMBED_TIMEOUT_SECONDS = 15.0
+ANALYZE_TIMEOUT_SECONDS = 600.0
+_NO_SDK_RETRIES = {"max_retries": 0}
+
+
 @contextmanager
-def _managed_client():
+def _managed_client(timeout: float = EMBED_TIMEOUT_SECONDS):
     # The SDK does not close its HTTP client on context-manager exit. Own the
-    # transport explicitly, preserving its default timeout and redirect policy.
+    # transport explicitly, preserving its redirect policy. Long-running video
+    # analysis keeps the generous default; embeddings pass a short timeout.
     import httpx
 
-    with httpx.Client(timeout=600, follow_redirects=True) as transport:
+    with httpx.Client(timeout=timeout, follow_redirects=True) as transport:
         yield _client(httpx_client=transport)
 
 
@@ -100,7 +109,9 @@ def embed_text(text: str, model: Optional[str] = None) -> Optional[List[float]]:
 @lru_cache(maxsize=512)
 def _embed_text_cached(text: str, model: str) -> List[float]:
     with _managed_client() as client:
-        resp = client.embed.create(model_name=model, text=text)
+        resp = client.embed.create(
+            model_name=model, text=text, request_options=_NO_SDK_RETRIES
+        )
         # SDK aliases the raw JSON 'float' vector key to `float_`.
         vector = list(resp.text_embedding.segments[0].float_)
         if not vector or not all(math.isfinite(value) for value in vector):
@@ -171,7 +182,7 @@ def analyze_clip(
     try:
         from twelvelabs.types import VideoContext_Url
 
-        with _managed_client() as client:
+        with _managed_client(timeout=ANALYZE_TIMEOUT_SECONDS) as client:
             resp = client.analyze(
                 model_name=model,
                 video=VideoContext_Url(url=video_url),
