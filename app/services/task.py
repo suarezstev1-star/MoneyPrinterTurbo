@@ -18,6 +18,7 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
+    cache_manager,
     elevenlabs_music,
     llm,
     loomloom,
@@ -720,7 +721,15 @@ def get_video_materials(
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    video_script=None,
+    warnings=None,
 ):
+    # Rate-limited (once an hour) cleanup of stale temp files and old cache.
+    try:
+        cache_manager.sweep()
+    except Exception as exc:
+        logger.warning(f"video cache sweep failed: {type(exc).__name__}: {exc}")
+
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -797,6 +806,18 @@ def get_video_materials(
             return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        # Sentence-aligned stock selection: only for a single video, because
+        # batch allocation splits one shared pool across several videos.
+        sentence_plan = None
+        if (
+            params.video_source in material.STOCK_SOURCES
+            and getattr(params, "video_count", 1) == 1
+            and video_script
+            and material.sentence_alignment_enabled(
+                getattr(params, "match_materials_to_script", False)
+            )
+        ):
+            sentence_plan = material.plan_sentence_queries(video_script)
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         try:
@@ -816,6 +837,8 @@ def get_video_materials(
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                warnings=warnings,
+                sentence_plan=sentence_plan,
             )
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
@@ -899,6 +922,13 @@ def get_video_materials(
                 f"failed to download video materials from {params.video_source}",
             )
             return None
+        if sentence_plan and any(entry.get("aligned") for entry in sentence_plan):
+            # Clips are already in narrative order; a random shuffle in the
+            # editor would destroy the sentence alignment.
+            try:
+                params.match_materials_to_script = True
+            except Exception as exc:
+                logger.warning(f"could not pin sequential concat: {exc}")
         return downloaded_videos
 
 
@@ -1770,12 +1800,15 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    material_warnings: list = []
     downloaded_videos = get_video_materials(
         task_id,
         params,
         video_terms,
         audio_duration,
         loomloom_video_request=loomloom_video_request,
+        video_script=video_script,
+        warnings=material_warnings,
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1790,6 +1823,7 @@ def _run_pipeline(
             state=const.TASK_STATE_COMPLETE,
             progress=100,
             materials=downloaded_videos,
+            warnings=material_warnings or None,
         )
         return {"materials": downloaded_videos}
 
@@ -1830,6 +1864,8 @@ def _run_pipeline(
             "video",
             "failed to generate final video",
         )
+    if material_warnings:
+        generation_warnings = material_warnings + list(generation_warnings or [])
 
     logger.success(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
