@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import difflib
 import io
 import inspect
 import json
@@ -115,10 +116,11 @@ def mktimestamp(time_unit: float) -> str:
     还需要这个格式化函数来兼容 Azure v2、Gemini、SiliconFlow 这些
     手工构造的字幕时间轴，因此这里内置一个等价实现。
     """
-    hour = math.floor(time_unit / 10**7 / 3600)
-    minute = math.floor((time_unit / 10**7 / 60) % 60)
-    seconds = (time_unit / 10**7) % 60
-    return f"{hour:02d}:{minute:02d}:{seconds:06.3f}"
+    total_ms = int(round(max(float(time_unit), 0.0) / 10**4))
+    hour, remainder = divmod(total_ms, 3_600_000)
+    minute, remainder = divmod(remainder, 60_000)
+    second, millisecond = divmod(remainder, 1000)
+    return f"{hour:02d}:{minute:02d}:{second:02d},{millisecond:03d}"
 
 
 def get_siliconflow_voices() -> list[str]:
@@ -1224,6 +1226,44 @@ def ensure_legacy_submaker_fields(sub_maker: SubMaker) -> SubMaker:
     return sub_maker
 
 
+_CJK_RANGES = (
+    (0x3040, 0x30FF),  # Hiragana / Katakana
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),  # Hangul syllables
+    (0xF900, 0xFAFF),
+    (0x20000, 0x2FFFF),
+)
+_STRONG_PAUSE_CHARS = set(".!?。！？…\n")
+_WEAK_PAUSE_CHARS = set(",;:，；：、")
+
+
+def _estimate_speech_weight(text: str) -> float:
+    """
+    Relative spoken duration of ``text`` when no word boundaries are available.
+
+    A CJK character carries roughly one syllable (about three Latin letters of
+    speech time), whitespace is nearly free, and punctuation adds a pause. This
+    keeps proportional splits of mixed CJK/Latin scripts from drifting.
+    """
+    weight = 0.0
+    for char in text or "":
+        code = ord(char)
+        if any(low <= code <= high for low, high in _CJK_RANGES):
+            weight += 3.0
+        elif char.isspace():
+            weight += 0.3
+        elif char in _STRONG_PAUSE_CHARS:
+            weight += 4.0
+        elif char in _WEAK_PAUSE_CHARS:
+            weight += 2.0
+        elif char.isalnum():
+            weight += 1.0
+        else:
+            weight += 0.2
+    return max(weight, 0.0)
+
+
 def populate_legacy_submaker_with_full_text(
     sub_maker: SubMaker, text: str, audio_duration_seconds: float
 ) -> SubMaker:
@@ -1265,7 +1305,7 @@ def populate_legacy_submaker_with_full_text(
     if not sentences:
         sentences = [normalized_text]
 
-    total_chars = sum(len(sentence) for sentence in sentences)
+    total_chars = sum(_estimate_speech_weight(sentence.strip()) for sentence in sentences)
     if total_chars <= 0:
         sub_maker.subs.append(normalized_text)
         sub_maker.offset.append((0, audio_duration_100ns))
@@ -1282,7 +1322,7 @@ def populate_legacy_submaker_with_full_text(
         if index == len(sentences) - 1:
             sentence_end = audio_duration_100ns
         else:
-            sentence_chars = len(cleaned_sentence)
+            sentence_chars = _estimate_speech_weight(cleaned_sentence)
             sentence_duration = max(
                 int(audio_duration_100ns * (sentence_chars / total_chars)),
                 1,
@@ -1330,7 +1370,8 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     默认超时，避免 WebUI 任务长期无反馈。
 
     使用方式：
-    - 默认 30 秒，覆盖常见短视频脚本的首包等待时间；
+    - 默认 30 秒，这是“空闲超时”：每收到一个数据块就重新计时，
+      因此长旁白只要持续有数据就不会超时；
     - 如用户处于慢网络或代理环境，可在 `config.toml` 里设置
       `edge_tts_timeout = 60`；
     - 设置为 0 或负数表示显式禁用超时，保留完全向后兼容。
@@ -1446,13 +1487,15 @@ def _stream_edge_tts_sync_with_timeout(
     thread = threading.Thread(target=_produce_chunks, daemon=True)
     thread.start()
 
+    # Idle timeout: the deadline is pushed back after every received chunk, so a
+    # long narration that keeps streaming never expires; only a stalled stream does.
     deadline = time.monotonic() + timeout_seconds
     try:
         while True:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 raise TimeoutError(
-                    f"edge_tts stream timed out after {timeout_seconds:g}s"
+                    f"edge_tts stream idle for more than {timeout_seconds:g}s"
                 )
             try:
                 item_type, payload = stream_queue.get(
@@ -1462,6 +1505,7 @@ def _stream_edge_tts_sync_with_timeout(
                 continue
             if item_type == "chunk":
                 on_chunk(payload)
+                deadline = time.monotonic() + timeout_seconds
             elif item_type == "error":
                 raise payload
             elif item_type == "done":
@@ -1488,7 +1532,7 @@ def stream_edge_tts_chunks(
     Args:
         communicate: edge_tts.Communicate 实例
         on_chunk: 每拿到一个事件块时执行的回调
-        timeout_seconds: 单次流式请求总超时；为 None 时不启用超时。
+        timeout_seconds: 流式空闲超时（每收到一个事件块即重置）；为 None 时不启用超时。
     """
     if hasattr(communicate, "stream_sync"):
         if timeout_seconds:
@@ -1505,19 +1549,25 @@ def stream_edge_tts_chunks(
         raise AttributeError("edge_tts communicate object has no stream method")
 
     async def _consume_async_stream():
-        async for chunk in communicate.stream():
+        # Idle timeout (reset per chunk) instead of a deadline for the whole stream.
+        iterator = communicate.stream().__aiter__()
+        while True:
+            try:
+                if timeout_seconds:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=timeout_seconds
+                    )
+                else:
+                    chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
             on_chunk(chunk)
 
     # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
     # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
     loop = asyncio.new_event_loop()
     try:
-        if timeout_seconds:
-            loop.run_until_complete(
-                asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
-            )
-        else:
-            loop.run_until_complete(_consume_async_stream())
+        loop.run_until_complete(_consume_async_stream())
     finally:
         loop.close()
 
@@ -3413,8 +3463,8 @@ def _build_subtitle_formatter():
     """
 
     def formatter(idx: int, start_time: float, end_time: float, sub_text: str) -> str:
-        start_t = mktimestamp(start_time).replace(".", ",")
-        end_t = mktimestamp(end_time).replace(".", ",")
+        start_t = mktimestamp(start_time)
+        end_t = mktimestamp(end_time)
         return f"{idx}\n{start_t} --> {end_t}\n{sub_text}\n"
 
     return formatter
@@ -3502,106 +3552,118 @@ def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
         return False
 
 
+_SUBTITLE_MATCH_THRESHOLD = 0.8
+_SUBTITLE_RESYNC_WINDOW = 80
+
+
+def _speech_key(text: str) -> str:
+    """Comparison key: NFC, no punctuation/underscores/whitespace, case-folded."""
+    text = unicodedata.normalize("NFC", text or "")
+    return re.sub(r"[_\W]+", "", _normalize_arabic(text)).lower()
+
+
+def _collect_subtitle_cues(sub_maker: SubMaker) -> list[tuple[str, int, int]]:
+    """Return ``(text, start, end)`` cues in 100ns units from either SubMaker shape."""
+    cues = []
+    if hasattr(sub_maker, "cues") and sub_maker.cues:
+        for cue in sub_maker.cues:
+            cues.append(
+                (
+                    unescape(cue.content),
+                    int(cue.start.total_seconds() * 10000000),
+                    int(cue.end.total_seconds() * 10000000),
+                )
+            )
+        return cues
+    offsets = getattr(sub_maker, "offset", [])
+    subs = getattr(sub_maker, "subs", [])
+    for (start, end), sub in zip(offsets, subs):
+        cues.append((unescape(sub), int(start), int(end)))
+    return cues
+
+
+def _align_cues_to_script(
+    cues: list[tuple[str, int, int]], script_lines: list[str]
+) -> tuple[list[str], int, int]:
+    """
+    Match script lines to cue runs one line at a time.
+
+    Lines with no speakable characters (emoji-only, separators) are skipped. A
+    line is accepted when its accumulated cues equal it exactly or are similar
+    enough (TTS may rewrite numbers/symbols). When a line cannot be matched the
+    cursor stays put and the next line searches a bounded window of cues, so a
+    single bad line no longer discards every later subtitle.
+
+    Returns ``(srt_items, speakable_line_count, matched_line_count)``.
+    """
+    formatter = _build_subtitle_formatter()
+    keys = [_speech_key(text) for text, _, _ in cues]
+    items: list[str] = []
+    speakable = 0
+    cursor = 0
+
+    for line in script_lines:
+        target = _speech_key(line)
+        if not target:
+            continue
+        speakable += 1
+        if cursor >= len(cues):
+            continue
+
+        best = None  # (score, start_index, end_index_exclusive)
+        for start in range(cursor, min(len(cues), cursor + _SUBTITLE_RESYNC_WINDOW)):
+            if not keys[start] and start != cursor:
+                continue
+            acc = ""
+            for end in range(start, len(cues)):
+                acc += keys[end]
+                if not acc:
+                    continue
+                if acc == target:
+                    score = 1.0
+                else:
+                    if len(acc) > len(target) * 1.5 + 4:
+                        break
+                    score = difflib.SequenceMatcher(None, acc, target).ratio()
+                if best is None or score > best[0] + 1e-9:
+                    best = (score, start, end + 1)
+                if score == 1.0:
+                    break
+            if best is not None and best[0] == 1.0:
+                break
+
+        if best is None or best[0] < _SUBTITLE_MATCH_THRESHOLD:
+            logger.warning(f"subtitle line could not be matched, skipped: {line!r}")
+            continue
+
+        _, first, last = best
+        start_time = cues[first][1]
+        end_time = max(cues[last - 1][2], start_time + 1)
+        items.append(
+            formatter(
+                idx=len(items) + 1,
+                start_time=start_time,
+                end_time=end_time,
+                sub_text=line.strip(),
+            )
+        )
+        cursor = last
+
+    return items, speakable, len(items)
+
+
 def _build_subtitle_items_from_edge_cues(
     sub_maker: SubMaker, script_lines: list[str]
 ) -> list[str]:
-    """
-    将 edge_tts 7.x 的细粒度 `cues` 聚合为按脚本断句的 SRT 片段。
-
-    背景：
-    edge_tts 7.x 的 `SubMaker.get_srt()` 更偏向逐词/逐短语的时间轴。
-    对英文做逐词高亮尚可，但中文短视频字幕如果直接照搬，会出现
-    “金钱 / 是 / 一种 / 社会 / 工具” 这种阅读体验很差的效果。
-
-    实现策略：
-    1. 逐个消费 cues 中的 `content`；
-    2. 累积成一段候选文本；
-    3. 当候选文本与脚本里当前目标断句匹配时，收敛为一个完整字幕段；
-    4. 使用第一条 cue 的开始时间和最后一条 cue 的结束时间，保证时间轴连续。
-    """
-    formatter = _build_subtitle_formatter()
-    sub_items = []
-    sub_index = 0
-    current_text = ""
-    current_start_time = None
-
-    for cue in sub_maker.cues:
-        cue_text = unescape(cue.content)
-        if current_start_time is None:
-            current_start_time = int(cue.start.total_seconds() * 10000000)
-
-        current_end_time = int(cue.end.total_seconds() * 10000000)
-        current_text += cue_text
-
-        matched_text = _match_script_line(script_lines, current_text, sub_index)
-        if not matched_text:
-            continue
-
-        sub_index += 1
-        sub_items.append(
-            formatter(
-                idx=sub_index,
-                start_time=current_start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
-            )
-        )
-        current_text = ""
-        current_start_time = None
-
-    if current_text.strip():
-        logger.warning(
-            f"edge cues still have unmatched text after aggregation: {current_text}"
-        )
-
-    return sub_items
+    """Align edge_tts 7.x cues to script lines (see ``_align_cues_to_script``)."""
+    return _align_cues_to_script(_collect_subtitle_cues(sub_maker), script_lines)[0]
 
 
 def _build_subtitle_items_from_legacy_submaker(
     sub_maker: SubMaker, script_lines: list[str]
 ) -> list[str]:
-    """
-    将项目原有 `subs/offset` 结构聚合为按脚本断句的 SRT 片段。
-
-    这部分保留了原来的核心思路，只是拆成独立函数，便于与 edge_tts 7.x
-    的 cues 聚合逻辑共享同一套断句匹配与落盘流程。
-    """
-    formatter = _build_subtitle_formatter()
-    start_time = -1.0
-    sub_items = []
-    sub_index = 0
-    sub_line = ""
-
-    legacy_offsets = getattr(sub_maker, "offset", [])
-    legacy_subs = getattr(sub_maker, "subs", [])
-    for _, (offset, sub) in enumerate(zip(legacy_offsets, legacy_subs)):
-        current_start_time, current_end_time = offset
-        if start_time < 0:
-            start_time = current_start_time
-
-        sub_line += unescape(sub)
-        matched_text = _match_script_line(script_lines, sub_line, sub_index)
-        if not matched_text:
-            continue
-
-        sub_index += 1
-        sub_items.append(
-            formatter(
-                idx=sub_index,
-                start_time=start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
-            )
-        )
-        start_time = -1.0
-        sub_line = ""
-
-    if sub_line.strip():
-        logger.warning(
-            f"legacy subtitle items still have unmatched text after aggregation: {sub_line}"
-        )
-
-    return sub_items
+    """Align legacy ``subs/offset`` data to script lines."""
+    return _align_cues_to_script(_collect_subtitle_cues(sub_maker), script_lines)[0]
 
 
 def _build_subtitle_items_from_edge_cues_words(sub_maker: SubMaker) -> list[str]:
@@ -3660,14 +3722,18 @@ def create_subtitle(
     text: str,
     subtitle_file: str,
     word_level: bool = False,
-):
+) -> dict:
     """
     优化字幕文件
     1. 将字幕文件按照标点符号分割成多行
-    2. 逐行匹配字幕文件中的文本
+    2. 逐行匹配字幕文件中的文本（单行失败不会影响后续行）
     3. 生成新的字幕文件
     如果 word_level 为 True，直接输出逐词单条字幕。
+
+    Returns a dict ``{"written", "total", "matched"}`` so callers can report a
+    partial or skipped result instead of silently succeeding.
     """
+    result = {"written": False, "total": 0, "matched": 0}
     text = _format_text(text)
     try:
         if word_level:
@@ -3676,26 +3742,32 @@ def create_subtitle(
             else:
                 sub_items = _build_subtitle_items_from_legacy_submaker_words(sub_maker)
             if sub_items:
-                _write_subtitle_items(sub_items, subtitle_file)
-                return
+                result.update(
+                    written=_write_subtitle_items(sub_items, subtitle_file),
+                    total=len(sub_items),
+                    matched=len(sub_items),
+                )
+                return result
 
         script_lines = utils.split_string_by_punctuations(text)
-        if hasattr(sub_maker, "cues") and sub_maker.cues:
-            sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
-        else:
-            sub_items = _build_subtitle_items_from_legacy_submaker(
-                sub_maker, script_lines
-            )
-
-        if len(sub_items) != len(script_lines):
+        sub_items, total, matched = _align_cues_to_script(
+            _collect_subtitle_cues(sub_maker), script_lines
+        )
+        result.update(total=total, matched=matched)
+        if not sub_items:
             logger.warning(
-                f"failed, sub_items len: {len(sub_items)}, script_lines len: {len(script_lines)}"
+                f"failed, no script line could be matched, script_lines len: {total}"
             )
-            return
+            return result
+        if matched != total:
+            logger.warning(
+                f"partial subtitles, matched {matched} of {total} script lines"
+            )
 
-        _write_subtitle_items(sub_items, subtitle_file)
+        result["written"] = _write_subtitle_items(sub_items, subtitle_file)
     except Exception as e:
         logger.error(f"failed, error: {str(e)}")
+    return result
 
 
 def _get_audio_duration_from_submaker(sub_maker: SubMaker):
