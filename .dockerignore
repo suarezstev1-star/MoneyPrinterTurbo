@@ -28,3 +28,11 @@ logs/
 
 storage/
 config.toml
+
+# Not needed in the image
+.github/
+.claude/
+Dockerfile*
+docker-compose*.yml
+coverage.xml
+.coverage

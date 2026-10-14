@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+# Least privilege: CI only needs to read the repository.
+permissions:
+  contents: read
+
 jobs:
   tests:
     name: Python ${{ matrix.python-version }} tests
@@ -56,6 +60,18 @@ jobs:
       - name: Lint Python sources
         if: matrix.python-version == '3.11'
         run: uv run --no-sync ruff check app cli.py main.py webui test docs/skill
+
+      # Advisory only (non-blocking): broader Ruff rules (bugbear, bandit) and a
+      # type check. Findings are reported in the log; tighten to blocking once
+      # the existing backlog is burned down.
+      - name: Lint (advisory, bugbear + security rules)
+        if: matrix.python-version == '3.11'
+        run: uv run --no-sync ruff check --select B,S --exit-zero --statistics app cli.py main.py webui docs/skill
+
+      - name: Type check (advisory)
+        if: matrix.python-version == '3.11'
+        continue-on-error: true
+        run: uvx --from mypy==1.13.0 mypy app --ignore-missing-imports --no-error-summary
 
       - name: Run unit tests with coverage
         # pytest 兼容现有 unittest.TestCase，同时会收集仓库中的 pytest 风格
