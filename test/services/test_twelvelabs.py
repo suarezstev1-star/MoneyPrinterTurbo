@@ -60,7 +60,7 @@ class TestTwelveLabsService(unittest.TestCase):
     def _client_returning(self, vectors_by_text):
         """Build a fake TwelveLabs client whose embed.create returns canned vectors."""
 
-        def fake_create(*, model_name, text):
+        def fake_create(*, model_name, text, **_kwargs):
             seg = MagicMock()
             seg.float_ = vectors_by_text[text]
             resp = MagicMock()

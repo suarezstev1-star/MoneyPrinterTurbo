@@ -78,6 +78,8 @@ def test_fluxionai_defaults_and_group_overrides(
                 factory.assert_called_once_with(
                     api_key="test-fluxion-key",
                     base_url=base_url.strip() or "https://fluxionai.space/v1",
+                    timeout=120.0,
+                    max_retries=1,
                 )
     assert result == "你好，世界！"
     assert len(requests) == 1

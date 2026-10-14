@@ -22,7 +22,7 @@ class TestLlmClientCleanup(unittest.TestCase):
                     transport = httpx.Client(transport=httpx.MockTransport(request))
                     cls = AzureOpenAI if constructor == "AzureOpenAI" else OpenAI
                     def create(**kwargs):
-                        return cls(**kwargs, max_retries=0, http_client=transport)
+                        return cls(**{**kwargs, "max_retries": 0}, http_client=transport)
                     with patch.object(llm, constructor, side_effect=create):
                         result = llm._generate_response("hello", app_config={"llm_provider": provider, **settings})
                     self.assertEqual(result.startswith("Error:"), failed, result)
@@ -35,7 +35,7 @@ class TestLlmClientCleanup(unittest.TestCase):
                 raise httpx.ReadError("lost SSE connection")
         transport = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=BrokenStream())))
         def create(**kwargs):
-            return OpenAI(**kwargs, max_retries=0, http_client=transport)
+            return OpenAI(**{**kwargs, "max_retries": 0}, http_client=transport)
         with patch.object(llm, "OpenAI", side_effect=create):
             result = llm._generate_response("hello", app_config={"llm_provider": "modelscope", "modelscope_api_key": "test-key", "modelscope_model_name": "test-model", "modelscope_base_url": "https://example.test/v1"})
         self.assertTrue(result.startswith("Error:"), result)
