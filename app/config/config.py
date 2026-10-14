@@ -30,6 +30,7 @@ _UTF8_BOM = "\ufeff"
 _CONFIG_LOCK_TIMEOUT_SECONDS = 30.0
 _CONFIG_LOCK_POLL_SECONDS = 0.05
 _CONFIG_READ_RETRIES = 5
+_IS_WINDOWS = os.name == "nt"
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows only
     import msvcrt
@@ -102,19 +103,28 @@ def _locked_path(path, *, exclusive, create=False, timeout=None):
 @contextmanager
 def _config_file_locks(*, exclusive):
     """
-    Lock both a sidecar lock file and the config file itself.
+    Lock a sidecar lock file and, on POSIX, the config file itself.
 
     The sidecar covers shared directories (atomic replace swaps the config
     inode, so locking only that inode would not exclude peers). Locking the
     config file covers Docker single-file bind mounts, where the sidecar lives
     in each container's own filesystem but the config inode is shared.
+
+    On Windows ``msvcrt.locking`` is a mandatory byte-range lock: it would make
+    every other read of the locked file fail with PermissionError. There only
+    writers take the sidecar lock (mutual exclusion among writers); config.toml
+    is never locked and readers take no lock, relying on retry instead.
     """
+    if _IS_WINDOWS and not exclusive:
+        yield
+        return
     lock_path = os.path.join(
         os.path.dirname(os.path.abspath(config_file)), ".config.toml.lock"
     )
     with ExitStack() as stack:
         stack.enter_context(_locked_path(lock_path, exclusive=exclusive, create=True))
-        stack.enter_context(_locked_path(config_file, exclusive=exclusive))
+        if not _IS_WINDOWS:
+            stack.enter_context(_locked_path(config_file, exclusive=exclusive))
         yield
 
 
@@ -568,7 +578,9 @@ def _load_toml_with_retry(config_path):
                 with _config_file_locks(exclusive=False):
                     return toml.load(config_path)
             return toml.load(config_path)
-        except (toml.TomlDecodeError, UnicodeDecodeError):
+        except (toml.TomlDecodeError, UnicodeDecodeError, PermissionError):
+            # PermissionError: Windows denies reads while a writer replaces or
+            # holds the file; it is transient, so back off briefly and retry.
             if attempt == _CONFIG_READ_RETRIES - 1:
                 raise
             time.sleep(0.05 * (attempt + 1))
@@ -771,12 +783,21 @@ def save_config(force=False):
         with _config_file_locks(exclusive=True):
             disk_config = None
             disk_text = None
-            try:
-                with open(config_file, mode="r", encoding="utf-8") as f:
-                    disk_text = f.read()
-                disk_config = toml.loads(disk_text.lstrip(_UTF8_BOM))
-            except (OSError, UnicodeError, toml.TomlDecodeError):
-                disk_config = None
+            for attempt in range(_CONFIG_READ_RETRIES):
+                try:
+                    with open(config_file, mode="r", encoding="utf-8") as f:
+                        disk_text = f.read()
+                    disk_config = toml.loads(disk_text.lstrip(_UTF8_BOM))
+                    break
+                except PermissionError:
+                    # Transient on Windows; never fall back to a wholesale
+                    # overwrite just because a reader briefly held the file.
+                    if attempt == _CONFIG_READ_RETRIES - 1:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                except (OSError, UnicodeError, toml.TomlDecodeError):
+                    disk_config = None
+                    break
 
             if disk_config is None:
                 merged_config = config_to_save
@@ -806,7 +827,15 @@ def save_config(force=False):
                     os.fsync(f.fileno())
                 _best_effort_chmod_private(temp_path)
                 try:
-                    os.replace(temp_path, config_file)
+                    for attempt in range(_CONFIG_READ_RETRIES):
+                        try:
+                            os.replace(temp_path, config_file)
+                            break
+                        except PermissionError:
+                            # Windows: a concurrent reader has the target open.
+                            if attempt == _CONFIG_READ_RETRIES - 1:
+                                raise
+                            time.sleep(0.05 * (attempt + 1))
                     _fsync_directory(config_dir)
                 except OSError as exc:
                     if exc.errno != errno.EBUSY:

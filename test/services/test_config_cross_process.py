@@ -176,3 +176,57 @@ def test_reader_retries_while_writer_holds_partial_content(isolated_config):
         loaded = config._load_toml_config(str(isolated_config))
     assert loaded["app"]["existing"] == "keep"
     assert calls["n"] == 3
+
+
+def test_windows_never_locks_config_file_and_readers_take_no_lock(isolated_config):
+    locked = []
+    real_locked_path = config._locked_path
+
+    def spy(path, **kwargs):
+        locked.append((os.path.basename(path), kwargs.get("exclusive")))
+        return real_locked_path(path, **kwargs)
+
+    with (
+        patch.object(config, "_IS_WINDOWS", True),
+        patch.object(config, "_locked_path", side_effect=spy),
+    ):
+        # Reader: no lock of any kind.
+        assert config._load_toml_config(str(isolated_config))["app"]["existing"] == "keep"
+        assert locked == []
+        # Writer: only the sidecar is locked, never config.toml.
+        config.app["win"] = "1"
+        config.save_config()
+    assert locked == [(".config.toml.lock", True)]
+    assert tomllib.loads(isolated_config.read_text())["app"]["win"] == "1"
+
+
+def test_transient_permission_error_on_load_is_retried(isolated_config):
+    calls = {"n": 0}
+    real_load = config.toml.load
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(13, "Permission denied")
+        return real_load(path)
+
+    with patch.object(config.toml, "load", side_effect=flaky):
+        loaded = config._load_toml_config(str(isolated_config))
+    assert loaded["app"]["existing"] == "keep"
+    assert calls["n"] == 3
+
+
+def test_save_retries_transient_permission_error_on_replace(isolated_config):
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(13, "Permission denied")
+        return real_replace(src, dst)
+
+    config.app["retry"] = "1"
+    with patch.object(config.os, "replace", side_effect=flaky):
+        config.save_config()
+    assert tomllib.loads(isolated_config.read_text())["app"]["retry"] == "1"
