@@ -104,3 +104,19 @@ def patch_script_data(task_id: str, **updates: Any) -> bool:
             f"error={type(exc).__name__}, detail={exc}"
         )
         return False
+
+
+def has_sentence_alignment(task_id: str) -> bool:
+    """
+    判断任务是否记录了按句素材对齐结果。
+
+    对齐后的素材已经按脚本叙事顺序排列；最终拼接若再随机打乱，就会抵消对齐。
+    读取失败（文件不存在、损坏、权限问题）一律视为未对齐，保持原有拼接行为。
+    """
+    try:
+        with _script_lock(task_id):
+            with _script_file(task_id).open("r", encoding="utf-8") as script_file:
+                payload = json.load(script_file)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and bool(payload.get("sentence_alignment"))
