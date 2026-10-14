@@ -85,7 +85,7 @@ class TestScriptPromptOptions(unittest.TestCase):
             video_script_prompt="语气轻松，面向程序员",
         )
 
-        self.assertIn("# Role: Video Script Generator", prompt)
+        self.assertIn("# Role: Short-Form Video Script Writer", prompt)
         self.assertIn("- video subject: 咖啡", prompt)
         self.assertIn("- number of paragraphs: 3", prompt)
         self.assertIn("- language: zh-CN", prompt)
@@ -104,7 +104,7 @@ class TestScriptPromptOptions(unittest.TestCase):
             custom_system_prompt="Only write cinematic narration.",
         )
 
-        self.assertNotIn("# Role: Video Script Generator", prompt)
+        self.assertNotIn("# Role: Short-Form Video Script Writer", prompt)
         self.assertIn("Only write cinematic narration.", prompt)
         self.assertIn("- video subject: 露营", prompt)
         self.assertIn("- number of paragraphs: 2", prompt)
@@ -171,10 +171,12 @@ class TestScriptPromptOptions(unittest.TestCase):
     def test_generate_script_returns_empty_when_provider_always_fails(self):
         with patch.object(
             llm, "_generate_response", return_value="Error: invalid API key"
-        ):
-            result = llm.generate_script(video_subject="Coffee")
+        ) as generate_response:
+            with self.assertRaisesRegex(llm.LLMError, "invalid API key"):
+                llm.generate_script(video_subject="Coffee")
 
-        self.assertEqual(result, "")
+        # An auth failure is permanent, so it must not be retried.
+        self.assertEqual(generate_response.call_count, 1)
 
     def test_generate_script_does_not_return_stale_quota_error_after_retries(self):
         responses = ["当日额度已消耗完"] + [
@@ -183,10 +185,14 @@ class TestScriptPromptOptions(unittest.TestCase):
         with patch.object(
             llm, "_generate_response", side_effect=responses
         ) as generate_response:
-            result = llm.generate_script(video_subject="Coffee")
+            with self.assertRaises(llm.LLMError) as caught:
+                llm.generate_script(video_subject="Coffee")
 
-        self.assertEqual(result, "")
-        self.assertEqual(generate_response.call_count, llm._max_retries)
+        # The quota text is surfaced as the failure reason, never as narration,
+        # and it is not retried.
+        self.assertIn("当日额度已消耗完", str(caught.exception))
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(generate_response.call_count, 1)
 
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
@@ -247,7 +253,7 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
 
-    def test_generate_terms_returns_empty_list_on_provider_error(self):
+    def test_generate_terms_raises_real_reason_on_provider_error(self):
         """
         Provider 错误必须保持 generate_terms 的 List[str] 返回契约。
 
@@ -258,14 +264,15 @@ class TestScriptPromptOptions(unittest.TestCase):
             llm,
             "_generate_response",
             return_value="Error: invalid API key",
-        ):
-            result = llm.generate_terms(
-                video_subject="startup story",
-                video_script="A short startup story.",
-            )
+        ) as generate_response:
+            with self.assertRaisesRegex(llm.LLMError, "invalid API key"):
+                llm.generate_terms(
+                    video_subject="startup story",
+                    video_script="A short startup story.",
+                )
 
-        self.assertEqual(result, [])
-        self.assertIsInstance(result, list)
+        # Permanent auth failure: surfaced immediately, never as a term list.
+        self.assertEqual(generate_response.call_count, 1)
 
     def test_generate_terms_retries_non_string_items_in_recovered_json(self):
         """The prose-wrapped JSON recovery path must enforce List[str] too."""
@@ -492,6 +499,8 @@ class TestGenerateResponseTransportLimits(unittest.TestCase):
         client_constructor.assert_called_once_with(
             api_key="test-key",
             base_url="https://example.test/v1",
+            timeout=120.0,
+            max_retries=1,
         )
 
 
@@ -1037,6 +1046,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="pollinations-test-key",
             base_url="https://gen.pollinations.ai/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1079,6 +1090,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="anthropic-test-key",
             base_url="https://api.anthropic.com/v1/",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1123,8 +1136,13 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertEqual(result, "hello\ngemini")
         self.assertEqual(
             captured["client_kwargs"],
-            {"api_key": "gemini-test-key", "http_options": None},
+            {
+                "api_key": "gemini-test-key",
+                "http_options": captured["client_kwargs"]["http_options"],
+            },
         )
+        self.assertEqual(captured["client_kwargs"]["http_options"].timeout, 120000)
+        self.assertIsNone(captured["client_kwargs"]["http_options"].base_url)
         self.assertEqual(captured["model"], "gemini-test-model")
         self.assertEqual(captured["contents"], "Say hello")
         self.assertEqual(captured["config"].max_output_tokens, 2048)
@@ -1189,6 +1207,8 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
             ),
             default_headers={"cf-aig-gateway-id": "default"},
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1504,6 +1524,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="apimart-key",
             base_url="https://api.apimart.ai/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1546,6 +1568,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="aihubmix-key",
             base_url="https://aihubmix.com/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1583,6 +1607,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="aimlapi-key",
             base_url="https://api.aimlapi.com/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1625,6 +1651,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="evolink-key",
             base_url="https://direct.evolink.ai/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1675,6 +1703,8 @@ class TestLiteLLMProvider(unittest.TestCase):
                 openai_client.assert_called_once_with(
                     api_key="iflytek-key",
                     base_url=expected_base_url,
+                    timeout=120.0,
+                    max_retries=1,
                 )
                 self.assertEqual(
                     fake_completions.kwargs,
@@ -1716,6 +1746,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="openrouter-key",
             base_url="https://openrouter.ai/api/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1757,6 +1789,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="api-route-key",
             base_url="https://www.api-route.com/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1799,6 +1833,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="volcengine-key",
             base_url="https://ark.cn-beijing.volces.com/api/v3",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1861,6 +1897,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="groq-test-key",
             base_url="https://api.groq.com/openai/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(result, "hello\ngroq")
 
@@ -1892,6 +1930,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="ollama",
             base_url=expected_base_url,
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -1981,6 +2021,8 @@ class TestLiteLLMProvider(unittest.TestCase):
         openai_client.assert_called_once_with(
             api_key="mimo-key",
             base_url="https://api.xiaomimimo.com/v1",
+            timeout=120.0,
+            max_retries=1,
         )
         self.assertEqual(
             fake_completions.kwargs,
@@ -2026,6 +2068,8 @@ class TestLiteLLMProvider(unittest.TestCase):
             api_key="azure-key",
             api_version="2024-02-15-preview",
             azure_endpoint="https://example.openai.azure.com",
+            timeout=120.0,
+            max_retries=1,
         )
         openai_client.assert_not_called()
         self.assertEqual(
@@ -2720,7 +2764,8 @@ class TestRetryWarningBoundary(unittest.TestCase):
             ),
             patch.object(llm, "logger") as mock_logger,
         ):
-            llm.generate_script(video_subject="test subject")
+            with self.assertRaises(llm.LLMError):
+                llm.generate_script(video_subject="test subject")
 
         count = self._trying_again_count(mock_logger, "trying again")
         self.assertEqual(

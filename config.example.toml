@@ -247,6 +247,15 @@ sonilo_timeout = 600
 # Registry defaults; only set them when you need an explicit override.
 llm_provider = "moonshot"
 
+# LLM request reliability (all optional; defaults shown).
+# Per-request timeout in seconds for script/term generation.
+# llm_request_timeout = 120
+# Base delay in seconds for exponential backoff (with jitter) between retries.
+# Auth, model-not-found and quota errors are never retried.
+# llm_retry_base_delay = 1.0
+# Total wall-clock budget in seconds for all retries of one generation call.
+# llm_total_budget = 300
+
 # Kimi / Moonshot AI
 # API key: https://platform.kimi.com?track_id=track-6eec1e56a4494e52adcaebbcbbefce59&aff=moneyprinterturbo
 moonshot_api_key = ""
