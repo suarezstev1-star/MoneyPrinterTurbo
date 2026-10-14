@@ -38,5 +38,9 @@ services:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
     volumes: *common-volumes
-    environment: *common-environment
+    # 容器内部必须监听 0.0.0.0，宿主机端口已绑定 127.0.0.1，属于可信网络。
+    environment:
+      <<: *common-environment
+      LISTEN_HOST: "0.0.0.0"
+      ALLOW_UNAUTHENTICATED_REMOTE_API: "true"
     restart: always

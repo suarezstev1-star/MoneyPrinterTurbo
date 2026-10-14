@@ -635,8 +635,15 @@ ui = _SynchronizedConfig(
 hostname = socket.gethostname()
 
 log_level = _cfg.get("log_level", "DEBUG")
-listen_host = _cfg.get("listen_host", "0.0.0.0")
+# Docker 容器内部必须监听 0.0.0.0，通过环境变量覆盖，不必修改共享的 config.toml。
+listen_host = os.getenv("LISTEN_HOST") or _cfg.get("listen_host", "127.0.0.1")
 listen_port = _cfg.get("listen_port", 8080)
+_allow_remote_env = os.getenv("ALLOW_UNAUTHENTICATED_REMOTE_API")
+allow_unauthenticated_remote_api = (
+    _allow_remote_env.strip().lower() in {"1", "true", "yes", "on"}
+    if _allow_remote_env is not None
+    else _cfg.get("allow_unauthenticated_remote_api", False) is True
+)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
 project_description = _cfg.get(
     "project_description",

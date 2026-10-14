@@ -7,9 +7,17 @@
 # =============================================================================
 # Log level: DEBUG, INFO, WARNING, or ERROR.
 log_level = "DEBUG"
-# Use 127.0.0.1 for local-only access. 0.0.0.0 listens on all network interfaces.
-listen_host = "0.0.0.0"
+# 127.0.0.1 keeps the API local-only. 0.0.0.0 listens on all network interfaces
+# and then requires app.api_key below; the API refuses to start otherwise unless
+# allow_unauthenticated_remote_api is true (only for a trusted network, e.g. a
+# Docker port already bound to 127.0.0.1 on the host). The LISTEN_HOST and
+# ALLOW_UNAUTHENTICATED_REMOTE_API environment variables override both values.
+# 127.0.0.1 仅允许本机访问。0.0.0.0 会监听所有网卡，此时必须配置 app.api_key，
+# 否则 API 拒绝启动；只有在可信网络（例如宿主机端口已绑定 127.0.0.1 的 Docker）
+# 中才应开启 allow_unauthenticated_remote_api。
+listen_host = "127.0.0.1"
 listen_port = 8080
+allow_unauthenticated_remote_api = false
 
 [app]
 
