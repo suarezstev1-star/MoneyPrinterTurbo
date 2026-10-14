@@ -15,6 +15,49 @@ from loguru import logger
 from app.models import const
 
 
+_REDACTED = "[REDACTED]"
+_SECRET_PATTERNS = (
+    # credentials embedded in URLs: scheme://user:pass@host
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1" + _REDACTED + "@"),
+    # secret-looking query parameters / key=value / "key": "value" pairs
+    (
+        re.compile(
+            r"""(?ix)
+            (\b[\w.-]*(?:api[_-]?key|apikey|token|secret|password|passwd|authorization|signature|sig|key)[\w.-]*
+            ["']?\s*[=:]\s*["']?)
+            (?:bearer\s+)?[^\s&"',;)}\]]+
+            """
+        ),
+        r"\1" + _REDACTED,
+    ),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer " + _REDACTED),
+    # common vendor key shapes
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}"), _REDACTED),
+    (re.compile(r"\b(?:ghp|gho|ghs|ghu|github_pat)_[A-Za-z0-9_]{16,}"), _REDACTED),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), _REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), _REDACTED),
+)
+
+
+def redact_secrets_in_text(text: Any, extra_secrets: Iterable[str] = ()) -> str:
+    """Mask credentials in free text (provider errors, URLs) before it is stored or returned.
+
+    ``extra_secrets`` are literal values (e.g. configured API keys) removed
+    wherever they appear; values shorter than 4 characters are ignored to avoid
+    mangling ordinary words.
+    """
+    result = "" if text is None else str(text)
+    for secret in sorted(
+        {str(s) for s in (extra_secrets or ()) if s and len(str(s)) >= 4},
+        key=len,
+        reverse=True,
+    ):
+        result = result.replace(secret, _REDACTED)
+    for pattern, replacement in _SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
 def get_response(status: int, data: Any = None, message: str = ""):
     obj = {
         "status": status,
