@@ -25,6 +25,13 @@ class FakeClip:
         return FakeClip(self.duration / factor)
 
 
+@pytest.fixture(autouse=True)
+def _hard_cuts():
+    # Default crossfades overlap clips; these tests pin hard-cut coverage math.
+    with patch.dict(video.config.app, {"video_crossfade_seconds": 0}):
+        yield
+
+
 @pytest.fixture
 def render_batch(tmp_path):
     def run(*, sources, duration=5.9, match=True, count=3, speed=1,
@@ -141,9 +148,12 @@ def test_short_sources_and_looping_still_fill_narration(render_batch):
     assert result.selections[0]["local_files"] == [
         "short.mp4", "long.mp4", "short.mp4", "long.mp4",
     ]
-    assert result.warnings == [
+    # Repeating short footage is now reported alongside the reuse warning.
+    assert {w["code"] for w in result.warnings} == {"batch_materials_reused", "footage_repeated"}
+    assert [w for w in result.warnings if w["code"] == "batch_materials_reused"] == [
         {"code": "batch_materials_reused", "video_index": 2, "count": 2},
     ]
+    assert {w["video_index"] for w in result.warnings if w["code"] == "footage_repeated"} == {1, 2}
 
 
 def test_failed_clip_does_not_count_as_used(render_batch):

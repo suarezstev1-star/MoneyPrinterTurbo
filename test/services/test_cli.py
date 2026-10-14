@@ -2105,7 +2105,7 @@ class TestCliUiDefaults(unittest.TestCase):
         self.assertEqual(params.voice_volume, 1.0)
         self.assertEqual(params.voice_rate, 1.0)
         self.assertEqual(params.stroke_color, "#000000")
-        self.assertEqual(params.stroke_width, 1.5)
+        self.assertEqual(params.stroke_width, 3.0)
         self.assertEqual(params.font_size, 60)
 
     def test_stop_at_subtitle_overrides_saved_subtitle_disabled(self):
