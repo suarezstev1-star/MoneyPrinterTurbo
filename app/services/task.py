@@ -1029,6 +1029,7 @@ def generate_final_videos(
         # 每条视频占 50% 进度中的一份，合成与最终编码各占一半。片段处理是
         # 合成里最耗时的部分，逐段推进这一半的进度。
         combine_share = 50 / params.video_count / 2
+        render_warnings = []
         video.combine_videos(
             combined_video_path=combined_video_path,
             video_paths=downloaded_videos,
@@ -1043,6 +1044,7 @@ def generate_final_videos(
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
+            warnings=render_warnings,
             **batch_options,
         )
         if allocate_batch_materials:
@@ -1109,7 +1111,9 @@ def generate_final_videos(
             output_file=final_video_path,
             params=params,
             bgm_file_override=bgm_file_override,
+            warnings=render_warnings,
         )
+        warnings.extend({**item, "video_index": index} for item in render_warnings)
         if (
             video_music_provider is not None
             and bgm_file_override
