@@ -281,7 +281,7 @@ class TestRedisTaskManager(unittest.TestCase):
         """Persisted Redis entries should run without waiting for a new API request."""
         self.manager.max_concurrent_tasks = 2
         self.redis_client.llen.return_value = 2
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("start", task_id="first", params=_video_params()),
             _queued_payload("start", task_id="second", params=_video_params()),
         ]
@@ -291,7 +291,7 @@ class TestRedisTaskManager(unittest.TestCase):
 
         self.assertEqual(execute_task.call_count, 2)
         self.assertEqual(self.manager.current_tasks, 2)
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
 
     def test_enqueue_serializes_video_params_without_mutating_task(self):
         """
@@ -327,18 +327,22 @@ class TestRedisTaskManager(unittest.TestCase):
                 ),
             },
         }
-        self.redis_client.lpop.return_value = json.dumps(payload)
+        self.redis_client.eval.return_value = json.dumps(payload)
 
         task = self.manager.dequeue()
 
-        self.redis_client.lpop.assert_called_once_with("task_queue")
+        self.redis_client.eval.assert_called_once()
+        self.assertEqual(self.redis_client.eval.call_args.args[2], "task_queue")
+        self.assertEqual(
+            self.redis_client.eval.call_args.args[3], self.manager.processing_key
+        )
         self.assertIs(task["func"], task_service.start)
         self.assertIsInstance(task["kwargs"]["params"], VideoParams)
         self.assertEqual(task["kwargs"]["params"].video_subject, "Coffee")
 
     def test_empty_queue_and_size_use_redis_length(self):
         """队列判空和长度必须直接反映 Redis 当前列表长度。"""
-        self.redis_client.lpop.return_value = None
+        self.redis_client.eval.return_value = None
         self.redis_client.llen.side_effect = [0, 2]
 
         self.assertIsNone(self.manager.dequeue())
@@ -373,14 +377,14 @@ class TestRedisTaskManager(unittest.TestCase):
                 ),
             },
         }
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             json.dumps(stale_payload),
             json.dumps(valid_payload),
         ]
 
         task = self.manager.dequeue()
 
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
         self.assertEqual(task["kwargs"]["task_id"], "task-valid")
         self.assertIsInstance(task["kwargs"]["params"], VideoParams)
         self.assertEqual(task["kwargs"]["params"].video_subject, "Tea")
@@ -397,10 +401,10 @@ class TestRedisTaskManager(unittest.TestCase):
                 ), "video_count": -1},
             },
         }
-        self.redis_client.lpop.side_effect = [json.dumps(stale_payload), None]
+        self.redis_client.eval.side_effect = [json.dumps(stale_payload), None]
 
         self.assertIsNone(self.manager.dequeue())
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
 
     def test_dequeue_marks_stale_task_failed_instead_of_leaving_it_processing(self):
         """
@@ -419,7 +423,7 @@ class TestRedisTaskManager(unittest.TestCase):
                 ), "video_count": 0},
             },
         }
-        self.redis_client.lpop.side_effect = [json.dumps(stale_payload), None]
+        self.redis_client.eval.side_effect = [json.dumps(stale_payload), None]
 
         with patch("app.controllers.manager.redis_manager.sm.state") as state:
             state.patch_task.return_value = True
@@ -445,7 +449,7 @@ class TestRedisTaskManager(unittest.TestCase):
                 ), "video_count": 0},
             },
         }
-        self.redis_client.lpop.side_effect = [json.dumps(stale_payload), None]
+        self.redis_client.eval.side_effect = [json.dumps(stale_payload), None]
 
         with patch("app.controllers.manager.redis_manager.sm.state") as state:
             state.patch_task.return_value = False
@@ -461,7 +465,7 @@ class TestRedisTaskManager(unittest.TestCase):
         队列里可能残留旧入口函数的任务。对不在 FUNC_MAP 中的名称直接索引会抛
         KeyError，绕过 dequeue 自己的丢弃策略，因此必须和校验失败路径一样跳过它。
         """
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("start_test", task_id="task-unknown-func"),
             _queued_payload("start", task_id="task-valid", params=_video_params()),
         ]
@@ -470,7 +474,7 @@ class TestRedisTaskManager(unittest.TestCase):
             state.patch_task.return_value = True
             task = self.manager.dequeue()
 
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
         self.assertIs(task["func"], task_service.start)
         self.assertEqual(task["kwargs"]["task_id"], "task-valid")
         state.patch_task.assert_called_once()
@@ -486,7 +490,7 @@ class TestRedisTaskManager(unittest.TestCase):
         抛出 dequeue，否则排在后面的可用任务再也不会被调度；其中能读出 task_id
         的条目还要把已经永久离开队列的任务收敛为失败。
         """
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             '{"func": "start", "args": [',
             json.dumps(["not", "a", "mapping"]),
             _queued_payload("retired-entry", task_id="task-retired"),
@@ -497,7 +501,7 @@ class TestRedisTaskManager(unittest.TestCase):
             state.patch_task.return_value = True
             task = self.manager.dequeue()
 
-        self.assertEqual(self.redis_client.lpop.call_count, 4)
+        self.assertEqual(self.redis_client.eval.call_count, 4)
         self.assertIs(task["func"], task_service.start)
         self.assertEqual(task["kwargs"]["task_id"], "task-valid")
         state.patch_task.assert_called_once()
@@ -508,7 +512,7 @@ class TestRedisTaskManager(unittest.TestCase):
 
     def test_dequeue_returns_none_when_only_unusable_entries_remain(self):
         """剩余条目全部不可用时，应返回 None 而不是抛出异常。"""
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("retired-entry"),
             None,
         ]
@@ -517,7 +521,7 @@ class TestRedisTaskManager(unittest.TestCase):
             result = self.manager.dequeue()
 
         self.assertIsNone(result)
-        self.assertEqual(self.redis_client.lpop.call_count, 2)
+        self.assertEqual(self.redis_client.eval.call_count, 2)
         state.patch_task.assert_not_called()
 
     def test_task_done_keeps_draining_queue_when_entry_is_unusable(self):
@@ -529,7 +533,7 @@ class TestRedisTaskManager(unittest.TestCase):
         可用任务，而不是把整个队列留在原地。
         """
         self.manager.current_tasks = 1
-        self.redis_client.lpop.side_effect = [
+        self.redis_client.eval.side_effect = [
             _queued_payload("retired-entry"),
             _queued_payload("start", task_id="task-next", params=_video_params()),
         ]
@@ -567,7 +571,7 @@ class TestRedisTaskManager(unittest.TestCase):
                         }
                     )
                 self.redis_client.reset_mock()
-                self.redis_client.lpop.side_effect = [
+                self.redis_client.eval.side_effect = [
                     broken,
                     _queued_payload(
                         "start", task_id="task-valid", params=_video_params()
@@ -578,7 +582,7 @@ class TestRedisTaskManager(unittest.TestCase):
                     state.patch_task.return_value = True
                     task = self.manager.dequeue()
 
-                self.assertEqual(self.redis_client.lpop.call_count, 2)
+                self.assertEqual(self.redis_client.eval.call_count, 2)
                 self.assertEqual(task["kwargs"]["task_id"], "task-valid")
                 self.assertIs(task["func"], task_service.start)
                 if expected_task_id is None:
@@ -594,7 +598,7 @@ class TestRedisTaskManager(unittest.TestCase):
 
     def test_dequeue_dispatches_payload_without_args_field(self):
         """args 字段整体缺失是既有格式（check_queue 取默认空元组），不能被丢掉。"""
-        self.redis_client.lpop.return_value = json.dumps(
+        self.redis_client.eval.return_value = json.dumps(
             {
                 "func": "start",
                 "kwargs": {"task_id": "task-no-args", "params": _video_params()},
@@ -629,7 +633,7 @@ class TestRedisTaskManager(unittest.TestCase):
         for case, payload in cases:
             with self.subTest(case=case):
                 self.redis_client.reset_mock()
-                self.redis_client.lpop.side_effect = [
+                self.redis_client.eval.side_effect = [
                     payload,
                     _queued_payload(
                         "start", task_id="task-valid", params=_video_params()
@@ -639,7 +643,7 @@ class TestRedisTaskManager(unittest.TestCase):
                 with patch("app.controllers.manager.redis_manager.sm.state") as state:
                     task = self.manager.dequeue()
 
-                self.assertEqual(self.redis_client.lpop.call_count, 2)
+                self.assertEqual(self.redis_client.eval.call_count, 2)
                 self.assertEqual(task["kwargs"]["task_id"], "task-valid")
                 state.patch_task.assert_not_called()
                 state.update_task.assert_not_called()

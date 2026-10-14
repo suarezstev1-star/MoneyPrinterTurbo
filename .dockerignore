@@ -28,3 +28,4 @@ logs/
 
 storage/
 config.toml
+.config.toml.lock
