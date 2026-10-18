@@ -24,7 +24,8 @@ from uuid import uuid4
 
 PREPARED_FORMATS = "mov,matroska,avi,mpegts,mpegvideo,ogg,flv,wav,mp3,flac,aac"
 SCHEMA_VERSION = 1
-RENDERER_VERSION = "local-ffmpeg-v1"
+RENDERER_VERSION = "local-ffmpeg-v2"
+RENDER_CRF = 20
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -726,6 +727,14 @@ class VideoProject:
                     "duration"
                 ]
                 vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height},setsar=1,fps={settings.fps}"
+                # Video is a whole number of frames and AAC a whole number of
+                # 1024-sample packets, so a scene whose audio and video differ by
+                # even a few milliseconds drifts further from the narration with
+                # every concatenated scene. Round the scene up to whole frames
+                # and pad/trim the audio to exactly that length.
+                frame_count = max(1, math.ceil(duration * settings.fps - 1e-6))
+                scene_seconds = frame_count / settings.fps
+                af = f"apad=whole_dur={scene_seconds:.6f},atrim=end={scene_seconds:.6f},asetpts=PTS-STARTPTS"
                 self._run(
                     base
                     + [
@@ -743,12 +752,18 @@ class VideoProject:
                         "1:a:0",
                         "-vf",
                         vf,
+                        "-af",
+                        af,
+                        "-frames:v",
+                        str(frame_count),
                         "-t",
-                        str(duration),
+                        f"{scene_seconds:.6f}",
                         "-c:v",
                         "libx264",
                         "-preset",
-                        "veryfast",
+                        "medium",
+                        "-crf",
+                        str(RENDER_CRF),
                         "-pix_fmt",
                         "yuv420p",
                         "-c:a",
@@ -787,8 +802,17 @@ class VideoProject:
                         "1",
                         "-i",
                         str(listing),
-                        "-c",
+                        # Video is stream-copied; audio is encoded once over the
+                        # whole timeline so per-scene AAC priming/padding cannot
+                        # accumulate into drift or clicks at the joins.
+                        "-c:v",
                         "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        "48000",
                         "-movflags",
                         "+faststart",
                         str(output),
@@ -797,7 +821,13 @@ class VideoProject:
                     timeout,
                 )
             elif spec["bgm"] and settings.bgm_volume:
-                mix = f"[1:a]volume={settings.bgm_volume}[music];[0:a][music]amix=inputs=2:duration=first:normalize=0[a]"
+                # Sidechain compression ducks the music under the narration; the
+                # narration copy feeding the compressor is split off untouched.
+                mix = (
+                    f"[0:a]asplit=2[voice][key];[1:a]volume={settings.bgm_volume}[music];"
+                    "[music][key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[ducked];"
+                    "[voice][ducked]amix=inputs=2:duration=first:normalize=0[a]"
+                )
                 self._run(
                     base
                     + [

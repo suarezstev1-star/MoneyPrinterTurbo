@@ -1707,6 +1707,39 @@ class TestTaskService(unittest.TestCase):
         )
         self.assertEqual(published_task["cross_post_error"], "upload failed")
 
+    def test_start_skips_cross_post_without_explicit_opt_in(self):
+        """API 请求默认 cross_post=False：即使配置了自动发布也不得发布。"""
+        params = VideoParams(video_subject="Coffee", cross_post=False)
+        service = tm.upload_post.upload_post_service
+        state = MemoryState()
+
+        with (
+            patch.object(tm, "generate_script", return_value="generated script"),
+            patch.object(tm, "generate_terms", return_value=["coffee"]),
+            patch.object(tm, "save_script_data"),
+            patch.object(
+                tm, "generate_audio", return_value=("audio.mp3", 5, object())
+            ),
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(tm, "get_video_materials", return_value=["clip.mp4"]),
+            patch.object(
+                tm,
+                "generate_final_videos",
+                return_value=(["final-1.mp4"], ["combined-1.mp4"], []),
+            ),
+            patch.object(service, "is_configured", return_value=True),
+            patch.object(type(service), "auto_upload", new_callable=PropertyMock, return_value=True),
+            patch.object(type(service), "platforms", new_callable=PropertyMock, return_value=["youtube"]),
+            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.sm, "state", state),
+            patch.object(tm._cross_post_executor, "submit") as submit,
+        ):
+            result = tm.start("no-cross-post", params)
+
+        cross_post.assert_not_called()
+        submit.assert_not_called()
+        self.assertIsNone(result["cross_post_state"])
+
     def test_start_returns_before_cross_post_worker_runs(self):
         """视频任务完成时只提交发布工作，不能在生成线程中同步上传。"""
         params = VideoParams(video_subject="Coffee")
@@ -2322,6 +2355,65 @@ class TestTaskService(unittest.TestCase):
             tm.const.CROSS_POST_STATE_COMPLETE,
         )
         active_future.set_result(None)
+
+    def test_recover_interrupted_tasks_fails_only_orphaned_processing_tasks(self):
+        """启动恢复只收敛执行进程已退出的任务，排队、远程和存活进程的任务保持原状。"""
+        state = MemoryState()
+        dead_owner = f"{tm.socket.gethostname()}:999999:dead"
+        live_owner = f"{tm.socket.gethostname()}:4242:live"
+        tasks = {
+            "orphaned": (tm.const.TASK_STATE_PROCESSING, dead_owner),
+            "queued-without-owner": (tm.const.TASK_STATE_PROCESSING, None),
+            "current-process": (
+                tm.const.TASK_STATE_PROCESSING,
+                tm._cross_post_process_owner,
+            ),
+            "other-live-process": (tm.const.TASK_STATE_PROCESSING, live_owner),
+            "remote-host": (tm.const.TASK_STATE_PROCESSING, "another-host:1:x"),
+            "completed": (tm.const.TASK_STATE_COMPLETE, dead_owner),
+        }
+        for task_id, (task_state, owner) in tasks.items():
+            fields = {"task_owner": owner} if owner else {}
+            state.update_task(task_id, state=task_state, progress=40, **fields)
+
+        def owner_alive(owner):
+            return owner != dead_owner
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "_is_cross_post_owner_alive", side_effect=owner_alive),
+        ):
+            recovered = tm.recover_interrupted_tasks(page_size=1)
+
+        self.assertEqual(recovered, 1)
+        orphaned = state.get_task("orphaned")
+        self.assertEqual(orphaned["state"], tm.const.TASK_STATE_FAILED)
+        self.assertEqual(orphaned["failed_stage"], "interrupted")
+        self.assertEqual(orphaned["error"], tm._INTERRUPTED_TASK_ERROR)
+        self.assertEqual(orphaned["progress"], 40)
+        self.assertIsNone(orphaned["task_owner"])
+        self.assertFalse(tm.is_task_busy(orphaned))
+        for task_id in (
+            "queued-without-owner",
+            "current-process",
+            "other-live-process",
+            "remote-host",
+        ):
+            self.assertEqual(
+                state.get_task(task_id)["state"],
+                tm.const.TASK_STATE_PROCESSING,
+                task_id,
+            )
+        self.assertEqual(
+            state.get_task("completed")["state"], tm.const.TASK_STATE_COMPLETE
+        )
+
+    def test_recover_interrupted_tasks_reports_state_errors(self):
+        """状态后端不可用时恢复返回 None，不能阻止 API 启动。"""
+        broken_state = MagicMock()
+        broken_state.list_task_ids.side_effect = RuntimeError("redis down")
+        with patch.object(tm.sm, "state", broken_state):
+            self.assertIsNone(tm.recover_interrupted_tasks())
 
     def test_recover_interrupted_cross_posts_scans_ids_only_once(self):
         """启动恢复不能依赖多次独立扫描的分页顺序。"""

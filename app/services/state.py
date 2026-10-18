@@ -1,5 +1,6 @@
 import ast
 import copy
+import json
 import threading
 from abc import ABC, abstractmethod
 
@@ -38,6 +39,56 @@ end
 
 return redis.call("DEL", KEYS[1])
 """
+
+
+_UNPARSED = object()
+_MAX_STORED_VALUE_CHARS = 16 * 1024 * 1024
+_MAX_STORED_VALUE_DEPTH = 32
+_ALLOWED_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _is_plain_literal(value, depth: int = 0) -> bool:
+    """Only str/int/float/bool/None and list/dict (of those) are task state."""
+    if depth > _MAX_STORED_VALUE_DEPTH:
+        return False
+    if isinstance(value, _ALLOWED_SCALAR_TYPES):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_plain_literal(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_plain_literal(item, depth + 1)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _reject_json_constant(name):
+    raise ValueError(f"unsupported JSON constant: {name}")
+
+
+def _parse_stored_value(value_str: str):
+    """Strictly parse a stored field; return _UNPARSED when it is not a literal.
+
+    JSON is tried first for container/quoted values. Records written by earlier
+    versions use Python reprs, so a literal fallback remains, but its result is
+    type-checked and bounded so unexpected content stays an opaque string.
+    """
+    if len(value_str) > _MAX_STORED_VALUE_CHARS:
+        return _UNPARSED
+    if value_str[:1] in ("{", "[", '"'):
+        try:
+            result = json.loads(value_str, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if _is_plain_literal(result):
+                return result
+    try:
+        result = ast.literal_eval(value_str)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return _UNPARSED
+    return result if _is_plain_literal(result) else _UNPARSED
 
 
 # Base class for state management
@@ -137,9 +188,9 @@ class RedisState(BaseState):
 
     Trust boundary: Redis is expected to be private to this application. Task
     values are written by MoneyPrinterTurbo and converted back from strings for
-    compatibility with existing state records. Do not expose this Redis database
-    to untrusted writers without replacing deserialization with a stricter
-    schema-based format.
+    compatibility with existing state records. Deserialization only accepts
+    JSON or plain literals (str/int/float/bool/None/list/dict); anything else
+    is returned as an opaque string.
     """
 
     def __init__(self, host="localhost", port=6379, db=0, password=None):
@@ -295,11 +346,9 @@ class RedisState(BaseState):
         """
         value_str = value.decode("utf-8")
 
-        try:
-            # try to convert byte string array to list
-            return ast.literal_eval(value_str)
-        except (ValueError, SyntaxError):
-            pass
+        parsed = _parse_stored_value(value_str)
+        if parsed is not _UNPARSED:
+            return parsed
 
         if value_str.isdigit():
             return int(value_str)

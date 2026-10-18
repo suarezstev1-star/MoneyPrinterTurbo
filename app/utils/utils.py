@@ -15,6 +15,49 @@ from loguru import logger
 from app.models import const
 
 
+_REDACTED = "[REDACTED]"
+_SECRET_PATTERNS = (
+    # credentials embedded in URLs: scheme://user:pass@host
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1" + _REDACTED + "@"),
+    # secret-looking query parameters / key=value / "key": "value" pairs
+    (
+        re.compile(
+            r"""(?ix)
+            (\b[\w.-]*(?:api[_-]?key|apikey|token|secret|password|passwd|authorization|signature|sig|key)[\w.-]*
+            ["']?\s*[=:]\s*["']?)
+            (?:bearer\s+)?[^\s&"',;)}\]]+
+            """
+        ),
+        r"\1" + _REDACTED,
+    ),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer " + _REDACTED),
+    # common vendor key shapes
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}"), _REDACTED),
+    (re.compile(r"\b(?:ghp|gho|ghs|ghu|github_pat)_[A-Za-z0-9_]{16,}"), _REDACTED),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), _REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), _REDACTED),
+)
+
+
+def redact_secrets_in_text(text: Any, extra_secrets: Iterable[str] = ()) -> str:
+    """Mask credentials in free text (provider errors, URLs) before it is stored or returned.
+
+    ``extra_secrets`` are literal values (e.g. configured API keys) removed
+    wherever they appear; values shorter than 4 characters are ignored to avoid
+    mangling ordinary words.
+    """
+    result = "" if text is None else str(text)
+    for secret in sorted(
+        {str(s) for s in (extra_secrets or ()) if s and len(str(s)) >= 4},
+        key=len,
+        reverse=True,
+    ):
+        result = result.replace(secret, _REDACTED)
+    for pattern, replacement in _SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
 def get_response(status: int, data: Any = None, message: str = ""):
     obj = {
         "status": status,
@@ -543,3 +586,74 @@ def load_locales(i18n_dir):
 
 def parse_extension(filename):
     return Path(filename).suffix.lower().lstrip('.')
+
+
+_URL_PATTERN = re.compile(
+    r"(?P<scheme>https?)://(?P<authority>[^\s'\"<>/?#]+)[^\s'\"<>]*", re.I
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<name>(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|"
+    r"authorization|x-api-key|key)['\"]?\s*[=:]\s*)(?:bearer\s+)?[^\s,;&'\"]+",
+    re.I,
+)
+_BEARER_PATTERN = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
+_KEY_LIKE_PATTERN = re.compile(r"\b(?:sk|pk|rk|AIza|xox[abp])[-_A-Za-z0-9]{16,}")
+_SECRET_CONFIG_NAME = re.compile(r"(key|token|secret|password)", re.I)
+_MIN_SECRET_LENGTH = 6
+
+
+def _configured_secret_values() -> list[str]:
+    """Collect credential-like values from [app] and proxy settings."""
+    from urllib.parse import quote_plus
+
+    from app.config import config
+
+    candidates: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    for section, is_proxy in ((config.app, False), (config.proxy, True)):
+        if not isinstance(section, dict):
+            continue
+        for name, value in section.items():
+            if is_proxy or _SECRET_CONFIG_NAME.search(str(name)):
+                collect(value)
+
+    secrets: list[str] = []
+    for value in candidates:
+        value = value.strip()
+        if len(value) < _MIN_SECRET_LENGTH:
+            continue
+        secrets.append(value)
+        encoded = quote_plus(value)
+        if encoded != value:
+            secrets.append(encoded)
+    # Replace longer values first so a secret containing another is fully hidden.
+    return sorted(set(secrets), key=len, reverse=True)
+
+
+def redact_sensitive_text(message: Any, *secrets: str) -> str:
+    """Remove credentials and URL details from text returned to API callers.
+
+    Provider exceptions can echo full request URLs (with query-string keys),
+    bearer tokens or configured credentials. Callers keep the host for
+    troubleshooting, but never paths, queries, userinfo or secret values.
+    """
+    text = str(message)
+    for secret in (*secrets, *_configured_secret_values()):
+        if secret:
+            text = text.replace(str(secret), "***")
+
+    def _url(match: re.Match) -> str:
+        authority = match.group("authority").rsplit("@", 1)[-1]
+        return f"{match.group('scheme')}://{authority}/..."
+
+    text = _URL_PATTERN.sub(_url, text)
+    text = _BEARER_PATTERN.sub("Bearer ***", text)
+    text = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(lambda m: f"{m.group('name')}***", text)
+    return _KEY_LIKE_PATTERN.sub("***", text)

@@ -1,5 +1,9 @@
 import inspect
 import json
+import os
+import socket
+import threading
+import uuid
 from typing import Dict
 
 import redis
@@ -11,6 +15,7 @@ from app.models import const
 from app.models.schema import AudioRequest, SubtitleRequest, VideoParams
 from app.services import state as sm
 from app.services import task as tm
+from app.utils.utils import redact_secrets_in_text
 
 FUNC_MAP = {
     "start": tm.start,
@@ -25,6 +30,25 @@ redis.call("RPUSH", KEYS[1], ARGV[2])
 return 1
 """
 
+# Reliable-queue claim: pop from the shared queue and push onto this worker's
+# processing list in one atomic step, so a crash never leaves a task in limbo.
+_CLAIM_TASK_SCRIPT = """
+local item = redis.call("LPOP", KEYS[1])
+if item then
+    redis.call("RPUSH", KEYS[2], item)
+end
+return item
+"""
+
+# Seconds a worker heartbeat key survives without a refresh. A worker whose key
+# expired is considered dead and its processing list is re-queued.
+WORKER_HEARTBEAT_TTL_SECONDS = 90
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 20
+
+# Identifies this OS process incarnation; a restarted process in a container
+# that reuses host:pid can then be told apart from its predecessor.
+_PROCESS_INCARNATION = uuid.uuid4().hex
+
 
 class RedisTaskManager(TaskManager):
     def __init__(
@@ -34,7 +58,126 @@ class RedisTaskManager(TaskManager):
         max_queued_tasks: int = 100,
     ):
         self.redis_client = redis.Redis.from_url(redis_url)
+        self._host_pid = f"{socket.gethostname()}:{os.getpid()}"
+        self.worker_id = f"{self._host_pid}:{uuid.uuid4().hex[:8]}"
+        self._inflight: Dict = {}
+        self._inflight_lock = threading.Lock()
+        self._heartbeat_thread = None
+        self._heartbeat_stop = threading.Event()
         super().__init__(max_concurrent_tasks, max_queued_tasks=max_queued_tasks)
+
+    # -- reliable queue bookkeeping ------------------------------------------------
+
+    @property
+    def processing_key(self) -> str:
+        return f"{self.queue}:processing:{self.worker_id}"
+
+    @property
+    def _worker_key(self) -> str:
+        return f"{self.queue}:worker:{self.worker_id}"
+
+    def _beat(self):
+        self.redis_client.set(
+            self._worker_key, _PROCESS_INCARNATION, ex=WORKER_HEARTBEAT_TTL_SECONDS
+        )
+
+    def _ensure_heartbeat(self):
+        """Advertise liveness and periodically recover dead workers' tasks."""
+        try:
+            self._beat()
+        except redis.RedisError as exc:
+            logger.warning(f"failed to refresh worker heartbeat: {exc}")
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="mpt-queue-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self):
+        while not self._heartbeat_stop.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                self._beat()
+                if self.requeue_orphaned_tasks():
+                    self.resume_queued_tasks()
+            except Exception as exc:  # keep the heartbeat alive across blips
+                logger.warning(f"queue heartbeat iteration failed: {exc}")
+
+    def close(self):
+        """Stop the heartbeat and release this worker's registration."""
+        self._heartbeat_stop.set()
+        try:
+            self.redis_client.delete(self._worker_key)
+        except redis.RedisError:
+            pass
+
+    def _ack(self, raw):
+        """Forget a claimed payload once it finished (or was discarded)."""
+        if raw is None:
+            return
+        try:
+            self.redis_client.lrem(self.processing_key, 1, raw)
+        except redis.RedisError as exc:
+            # The entry would be re-queued only if this worker later dies.
+            logger.warning(f"failed to acknowledge processed task: {exc}")
+
+    def _forget_inflight(self, task_id):
+        with self._inflight_lock:
+            stack = self._inflight.get(task_id)
+            if not stack:
+                return None
+            raw = stack.pop()
+            if not stack:
+                del self._inflight[task_id]
+            return raw
+
+    def requeue_orphaned_tasks(self) -> int:
+        """Move processing-list items of dead workers back to the queue head.
+
+        A worker is dead when its heartbeat key is missing, or when a key with
+        the same host:pid exists but belongs to another process incarnation
+        (a restart that reused the pid). ``RPOPLPUSH`` moves one item
+        atomically, so concurrent recoverers never duplicate or drop items.
+        """
+        moved = 0
+        prefix = f"{self.queue}:processing:"
+        for key in self.redis_client.scan_iter(match=f"{prefix}*"):
+            key = key.decode() if isinstance(key, bytes) else key
+            worker_id = key[len(prefix) :]
+            if worker_id == self.worker_id:
+                continue
+            if self._worker_is_alive(worker_id):
+                continue
+            while self.redis_client.rpoplpush(key, self.queue) is not None:
+                moved += 1
+        if moved:
+            logger.warning(f"re-queued {moved} task(s) from dead workers")
+        return moved
+
+    def _worker_is_alive(self, worker_id: str) -> bool:
+        marker = self.redis_client.get(f"{self.queue}:worker:{worker_id}")
+        if marker is None:
+            return False
+        marker = marker.decode() if isinstance(marker, bytes) else marker
+        same_slot = worker_id.rsplit(":", 1)[0] == self._host_pid
+        return not (same_slot and marker != _PROCESS_INCARNATION)
+
+    def execute_task(self, func, *args, **kwargs):
+        try:
+            super().execute_task(func, *args, **kwargs)
+        except Exception:
+            # The base class puts the task back on the queue; drop the claim so
+            # it is not also recovered from the processing list.
+            self._ack(self._forget_inflight(kwargs.get("task_id")))
+            raise
+
+    def run_task(self, func, *args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        finally:
+            self._ack(self._forget_inflight(kwargs.get("task_id")))
+            self.task_done()
 
     def create_queue(self):
         return "task_queue"
@@ -46,6 +189,8 @@ class RedisTaskManager(TaskManager):
         until an active task finishes. Fill each available local worker slot so
         an idle process does not leave old requests stuck in processing.
         """
+        self._ensure_heartbeat()
+        self.requeue_orphaned_tasks()
         for _ in range(max(0, self.max_concurrent_tasks - self.current_tasks)):
             self.check_queue()
 
@@ -89,14 +234,17 @@ class RedisTaskManager(TaskManager):
         # 循环而非单次弹出：某个任务在入队时可能满足当时的校验规则，但校验规则与
         # FUNC_MAP 成员会随部署变化（例如 VideoParams 新增 ge=1 约束、某个入口
         # 函数被移除），队列里因此可能残留按旧 schema 写入、或已无法解析的条目。
-        # lpop 是破坏性操作，一旦弹出就不能放回原位；这条任务已经从队列中永久
+        # claim 脚本（LPOP + RPUSH 到 processing 列表）从共享队列移走条目，一旦弹出就不能放回原位；这条任务已经从队列中永久
         # 移除了，不能再假装它还在。与其让异常从这里往上抛（check_queue 持锁调用
         # 本方法，异常会顺着 task_done → run_task 的 finally 把工作线程带崩；此后
         # 没有任务在跑，就再也不会有人调用 check_queue，队列里后面的任务会永久
         # 停在 processing），不如原地丢弃并继续尝试下一条，把"拿到一条可用任务
         # 或者队列确实空了"这个约定维持住。
         while True:
-            task_json = self.redis_client.lpop(self.queue)
+            self._ensure_heartbeat()
+            task_json = self.redis_client.eval(
+                _CLAIM_TASK_SCRIPT, 2, self.queue, self.processing_key
+            )
             # 只有 lpop 什么都没弹出来才代表队列空了。空字符串（或空 bytes）同样
             # 是一条不可用条目，它后面可能还排着可用的任务，所以要走下面的丢弃
             # 路径，而不是当成"队列结束"直接返回。
@@ -125,6 +273,7 @@ class RedisTaskManager(TaskManager):
                 )
             except (TypeError, ValueError, KeyError) as e:
                 logger.error(f"dropping unusable queued task: {e}")
+                self._ack(task_json)
                 # 与下面的 params 校验失败路径一致：只要能读出可用的 task_id，就把
                 # 这条已经永久离开队列的任务收敛为失败，否则 API/WebUI 会一直显示
                 # 它在 processing。payload 本身没法解析、或 task_id 不是字符串
@@ -143,7 +292,9 @@ class RedisTaskManager(TaskManager):
                         task_id,
                         state=const.TASK_STATE_FAILED,
                         failed_stage="dequeue",
-                        error=f"discarded stale queued task: {e}",
+                        error=redact_secrets_in_text(
+                            f"discarded stale queued task: {e}"
+                        ),
                     )
                 continue
 
@@ -160,6 +311,7 @@ class RedisTaskManager(TaskManager):
                             params_model = SubtitleRequest
                     task_kwargs["params"] = params_model(**task_kwargs["params"])
                 except ValidationError as e:
+                    self._ack(task_json)
                     logger.error(
                         "dropping queued task with params that fail current "
                         f"request model validation (queued under an older, more "
@@ -176,10 +328,16 @@ class RedisTaskManager(TaskManager):
                             task_id,
                             state=const.TASK_STATE_FAILED,
                             failed_stage="dequeue",
-                            error=f"discarded stale queued task: {e}",
+                            error=redact_secrets_in_text(
+                                f"discarded stale queued task: {e}"
+                            ),
                         )
                     continue
 
+            with self._inflight_lock:
+                self._inflight.setdefault(task_kwargs.get("task_id"), []).append(
+                    task_json
+                )
             return task_info
 
     def is_queue_empty(self):

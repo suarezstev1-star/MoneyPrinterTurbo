@@ -5,7 +5,8 @@ import shutil
 import socket
 import tempfile
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 
 import toml
 from loguru import logger
@@ -24,6 +25,133 @@ _pending_config_flush_scheduled = False
 _MISSING = object()
 _DELETE = object()
 _UTF8_BOM = "\ufeff"
+
+
+_CONFIG_LOCK_TIMEOUT_SECONDS = 30.0
+_CONFIG_LOCK_POLL_SECONDS = 0.05
+_CONFIG_READ_RETRIES = 5
+_IS_WINDOWS = os.name == "nt"
+
+if os.name == "nt":  # pragma: no cover - exercised on Windows only
+    import msvcrt
+
+    def _try_lock_fd(fd, exclusive):
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _unlock_fd(fd):
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _try_lock_fd(fd, exclusive):
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+
+    def _unlock_fd(fd):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _locked_path(path, *, exclusive, create=False, timeout=None):
+    """
+    Hold an advisory cross-process lock on ``path`` (flock / msvcrt.locking).
+
+    Yields True when locked and False when the path cannot be opened (missing
+    file, read-only directory, ...) or the filesystem has no lock support. A
+    lock that cannot be acquired in time raises TimeoutError so a wedged peer
+    never hangs the process forever.
+    """
+    timeout = _CONFIG_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    flags = os.O_RDWR if (exclusive or create) else os.O_RDONLY
+    if create:
+        flags |= os.O_CREAT
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        # A read-only mount refuses O_RDWR; flock still works on a read-only fd.
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            yield False
+            return
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _try_lock_fd(fd, exclusive)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    yield False
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for config lock: {path}")
+                time.sleep(_CONFIG_LOCK_POLL_SECONDS)
+        try:
+            yield True
+        finally:
+            try:
+                _unlock_fd(fd)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _config_file_locks(*, exclusive):
+    """
+    Lock a sidecar lock file and, on POSIX, the config file itself.
+
+    The sidecar covers shared directories (atomic replace swaps the config
+    inode, so locking only that inode would not exclude peers). Locking the
+    config file covers Docker single-file bind mounts, where the sidecar lives
+    in each container's own filesystem but the config inode is shared.
+
+    On Windows ``msvcrt.locking`` is a mandatory byte-range lock: it would make
+    every other read of the locked file fail with PermissionError. There only
+    writers take the sidecar lock (mutual exclusion among writers); config.toml
+    is never locked and readers take no lock, relying on retry instead.
+    """
+    if _IS_WINDOWS and not exclusive:
+        yield
+        return
+    lock_path = os.path.join(
+        os.path.dirname(os.path.abspath(config_file)), ".config.toml.lock"
+    )
+    with ExitStack() as stack:
+        stack.enter_context(_locked_path(lock_path, exclusive=exclusive, create=True))
+        if not _IS_WINDOWS:
+            stack.enter_context(_locked_path(config_file, exclusive=exclusive))
+        yield
+
+
+def _best_effort_chmod_private(path):
+    """Restrict the secrets file to its owner where the platform/mount allows."""
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # Bind mounts and foreign-owned files may refuse chmod; not fatal.
+        pass
+
+
+def _fsync_directory(path):
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 class _SynchronizedConfig(dict):
@@ -255,7 +383,7 @@ def _schedule_deferred_config_flush():
         raise
 
 
-def try_save_config():
+def try_save_config(force=False):
     """
     非阻塞保存 WebUI 配置，锁繁忙时交由当前长任务结束后保存。
 
@@ -263,6 +391,16 @@ def try_save_config():
     只有 Streamlit rerun 使用本函数，避免页面为等待视频任务而长时间无响应。
     """
     global _pending_config_save_requested
+
+    if force:
+        # Durable path for credential rotation: wait for the lock instead of
+        # deferring, apply queued updates, then write every in-memory key.
+        with _config_save_lock:
+            _apply_pending_config_updates_locked()
+            with _pending_config_lock:
+                _pending_config_save_requested = False
+            save_config(force=True)
+        return True
 
     with _pending_config_lock:
         _pending_config_save_requested = True
@@ -432,6 +570,24 @@ def get_default_ollama_base_url() -> str:
     return f"http://{_DOCKER_HOST_GATEWAY_NAME}:11434/v1"
 
 
+def _load_toml_with_retry(config_path):
+    """Read under a shared lock, retrying briefly if a writer is mid-update."""
+    for attempt in range(_CONFIG_READ_RETRIES):
+        try:
+            if os.path.abspath(config_path) == os.path.abspath(config_file):
+                with _config_file_locks(exclusive=False):
+                    return toml.load(config_path)
+            return toml.load(config_path)
+        except (toml.TomlDecodeError, UnicodeDecodeError, PermissionError):
+            # PermissionError: Windows denies reads while a writer replaces or
+            # holds the file; it is transient, so back off briefly and retry.
+            if attempt == _CONFIG_READ_RETRIES - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+        except TimeoutError:
+            return toml.load(config_path)
+
+
 def _load_toml_config(config_path: str):
     """
     加载 TOML，并兼容 Windows 编辑器可能写入的重复 UTF-8 BOM。
@@ -442,7 +598,7 @@ def _load_toml_config(config_path: str):
     不回写原文件，避免意外覆盖用户已经填写的 API Key。
     """
     try:
-        return toml.load(config_path)
+        return _load_toml_with_retry(config_path)
     except (toml.TomlDecodeError, UnicodeDecodeError) as exc:
         logger.warning(
             "load config failed, retry with UTF-8 BOM compatibility: "
@@ -482,6 +638,7 @@ def _initialize_config_from_example(example_file):
                 shutil.copyfileobj(source, destination)
             destination.flush()
             os.fsync(destination.fileno())
+        _best_effort_chmod_private(temp_path)
         try:
             if os.name == "nt":
                 # Windows rename refuses an existing destination. POSIX rename
@@ -538,77 +695,171 @@ def load_config():
     return _load_toml_config(config_file)
 
 
-def save_config():
+def _build_config_snapshot():
+    config_to_save = dict(_cfg)
+    config_to_save["app"] = dict(app)
+    config_to_save["azure"] = dict(azure)
+    config_to_save["siliconflow"] = dict(siliconflow)
+    config_to_save["minimax_tts"] = dict(minimax_tts)
+    config_to_save["elevenlabs"] = dict(elevenlabs)
+    config_to_save["chatterbox"] = dict(chatterbox)
+    config_to_save["kokoro"] = dict(kokoro)
+    config_to_save["fish_audio"] = dict(fish_audio)
+    config_to_save["voxcpm"] = dict(voxcpm)
+    config_to_save["ui"] = dict(ui)
+    return config_to_save
+
+
+# What this process last loaded from / wrote to disk. Diffing the live config
+# against it yields the keys this process changed, so a save can be merged onto
+# the file instead of overwriting changes made by another process.
+_baseline = {}
+
+
+def _config_changes(baseline, current, *, force=False):
+    """Return (sets, deletes) of ``(path, value)`` / ``path`` between two configs."""
+    sets, deletes = [], []
+    for key, value in current.items():
+        if isinstance(value, dict):
+            old = baseline.get(key)
+            old = old if isinstance(old, dict) else {}
+            for sub, sub_value in value.items():
+                if force or sub not in old or old[sub] != sub_value:
+                    sets.append(((key, sub), sub_value))
+            for sub in old:
+                if sub not in value:
+                    deletes.append((key, sub))
+            if not value and key not in baseline:
+                sets.append(((key,), {}))
+        elif force or key not in baseline or baseline[key] != value:
+            sets.append(((key,), value))
+    for key in baseline:
+        if key not in current:
+            deletes.append((key,))
+    return sets, deletes
+
+
+def _apply_config_changes(disk_config, sets, deletes):
+    merged = copy.deepcopy(disk_config)
+    for path, value in sets:
+        if len(path) == 1:
+            merged[path[0]] = copy.deepcopy(value)
+        else:
+            section = merged.get(path[0])
+            if not isinstance(section, dict):
+                section = merged[path[0]] = {}
+            section[path[1]] = copy.deepcopy(value)
+    for path in deletes:
+        if len(path) == 1:
+            merged.pop(path[0], None)
+        else:
+            section = merged.get(path[0])
+            if isinstance(section, dict):
+                section.pop(path[1], None)
+    return merged
+
+
+def save_config(force=False):
     """
-    原子保存运行时配置。
+    保存运行时配置（跨进程安全）。
 
-    Streamlit 的不同会话可能在相近时间触发配置保存。直接覆盖 config.toml 时，
-    另一个线程可能读取到只写了一部分的 TOML 内容。这里使用进程内可重入锁串行化
-    保存，并先写入同目录临时文件，再通过 os.replace 原子替换目标文件。
+    线程之间由进程内可重入锁串行化；多个进程（例如 docker-compose 中共享同一
+    挂载的 webui 与 api 容器）则通过 flock / msvcrt 文件锁串行化。持锁期间会
+    重新读取磁盘上的 config.toml，只把本进程相对上次加载/保存发生变化的键合并
+    进去，再写回，避免整份覆盖导致另一个进程刚写入的内容（例如轮换后的刷新
+    令牌）丢失。
 
-    Docker Desktop 单文件 bind mount 会把 config.toml 本身作为挂载点，
-    Linux 内核不允许通过 rename/replace 替换挂载点，因此会返回 EBUSY。
-    该场景下只能在锁内原地覆盖文件；其它异常仍然抛出，避免掩盖权限、磁盘
-    或路径错误。
+    写入先落到同目录临时文件再 os.replace 原子替换；Docker 单文件 bind mount
+    无法 rename（EBUSY）时，在锁内原地覆盖并 fsync，读取方持共享锁读取。
 
-    这仍然保留项目现有的单用户全局配置语义，不额外引入复杂的多用户配置系统；
-    主要用于避免多标签页或快速 rerun 时损坏配置文件。
+    ``force=True`` 把内存中的每个键都视为本进程已修改并覆盖磁盘上的值（磁盘上
+    仅存在于其它进程的键仍保留）；适用于必须落盘的凭据轮换。
     """
+    global _baseline
     with _config_save_lock:
-        config_to_save = dict(_cfg)
-        config_to_save["app"] = dict(app)
-        config_to_save["azure"] = dict(azure)
-        config_to_save["siliconflow"] = dict(siliconflow)
-        config_to_save["minimax_tts"] = dict(minimax_tts)
-        config_to_save["elevenlabs"] = dict(elevenlabs)
-        config_to_save["chatterbox"] = dict(chatterbox)
-        config_to_save["kokoro"] = dict(kokoro)
-        config_to_save["fish_audio"] = dict(fish_audio)
-        config_to_save["voxcpm"] = dict(voxcpm)
-        config_to_save["ui"] = dict(ui)
-        serialized_config = toml.dumps(config_to_save)
+        config_to_save = _build_config_snapshot()
+        config_dir = os.path.dirname(os.path.abspath(config_file))
 
-        # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
-        # 点击普通控件都产生一次磁盘写入和 fsync。
-        try:
-            with open(config_file, mode="r", encoding="utf-8") as f:
-                if f.read() == serialized_config:
-                    _cfg.clear()
-                    _cfg.update(config_to_save)
-                    return
-        except (OSError, UnicodeError):
-            pass
+        with _config_file_locks(exclusive=True):
+            disk_config = None
+            disk_text = None
+            for attempt in range(_CONFIG_READ_RETRIES):
+                try:
+                    with open(config_file, mode="r", encoding="utf-8") as f:
+                        disk_text = f.read()
+                    disk_config = toml.loads(disk_text.lstrip(_UTF8_BOM))
+                    break
+                except PermissionError:
+                    # Transient on Windows; never fall back to a wholesale
+                    # overwrite just because a reader briefly held the file.
+                    if attempt == _CONFIG_READ_RETRIES - 1:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                except (OSError, UnicodeError, toml.TomlDecodeError):
+                    disk_config = None
+                    break
 
-        temp_path = ""
-        try:
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".config-",
-                suffix=".toml.tmp",
-                dir=root_dir,
-            )
-            with os.fdopen(fd, mode="w", encoding="utf-8") as f:
-                f.write(serialized_config)
-                f.flush()
-                os.fsync(f.fileno())
+            if disk_config is None:
+                merged_config = config_to_save
+            else:
+                sets, deletes = _config_changes(_baseline, config_to_save, force=force)
+                merged_config = _apply_config_changes(disk_config, sets, deletes)
+            serialized_config = toml.dumps(merged_config)
+
+            # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
+            # 点击普通控件都产生一次磁盘写入和 fsync。
+            if disk_text is not None and disk_text == serialized_config:
+                _baseline = copy.deepcopy(config_to_save)
+                _cfg.clear()
+                _cfg.update(config_to_save)
+                return
+
+            temp_path = ""
             try:
-                os.replace(temp_path, config_file)
-            except OSError as exc:
-                if exc.errno != errno.EBUSY:
-                    raise
-
-                logger.warning(
-                    "atomic config replacement is unavailable for the mounted "
-                    f"file, fallback to in-place write: {config_file}"
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".config-",
+                    suffix=".toml.tmp",
+                    dir=root_dir,
                 )
-                with open(config_file, mode="w", encoding="utf-8") as f:
+                with os.fdopen(fd, mode="w", encoding="utf-8") as f:
                     f.write(serialized_config)
                     f.flush()
                     os.fsync(f.fileno())
-            _cfg.clear()
-            _cfg.update(config_to_save)
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                _best_effort_chmod_private(temp_path)
+                try:
+                    for attempt in range(_CONFIG_READ_RETRIES):
+                        try:
+                            os.replace(temp_path, config_file)
+                            break
+                        except PermissionError:
+                            # Windows: a concurrent reader has the target open.
+                            if attempt == _CONFIG_READ_RETRIES - 1:
+                                raise
+                            time.sleep(0.05 * (attempt + 1))
+                    _fsync_directory(config_dir)
+                except OSError as exc:
+                    if exc.errno != errno.EBUSY:
+                        raise
+
+                    logger.warning(
+                        "atomic config replacement is unavailable for the mounted "
+                        f"file, fallback to in-place write: {config_file}"
+                    )
+                    # r+/seek/truncate keeps the file non-empty throughout; the
+                    # exclusive lock plus shared-lock readers hide the rest.
+                    with open(config_file, mode="r+", encoding="utf-8") as f:
+                        f.seek(0)
+                        f.write(serialized_config)
+                        f.truncate()
+                        f.flush()
+                        os.fsync(f.fileno())
+                    _best_effort_chmod_private(config_file)
+                _baseline = copy.deepcopy(config_to_save)
+                _cfg.clear()
+                _cfg.update(config_to_save)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
 
 
 _cfg = load_config()
@@ -635,8 +886,15 @@ ui = _SynchronizedConfig(
 hostname = socket.gethostname()
 
 log_level = _cfg.get("log_level", "DEBUG")
-listen_host = _cfg.get("listen_host", "0.0.0.0")
+# Docker 容器内部必须监听 0.0.0.0，通过环境变量覆盖，不必修改共享的 config.toml。
+listen_host = os.getenv("LISTEN_HOST") or _cfg.get("listen_host", "127.0.0.1")
 listen_port = _cfg.get("listen_port", 8080)
+_allow_remote_env = os.getenv("ALLOW_UNAUTHENTICATED_REMOTE_API")
+allow_unauthenticated_remote_api = (
+    _allow_remote_env.strip().lower() in {"1", "true", "yes", "on"}
+    if _allow_remote_env is not None
+    else _cfg.get("allow_unauthenticated_remote_api", False) is True
+)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
 project_description = _cfg.get(
     "project_description",
@@ -649,6 +907,8 @@ app["redis_host"] = os.getenv(
     "MPT_APP_REDIS_HOST",
     os.getenv("REDIS_HOST", app.get("redis_host", "localhost")),
 )
+
+_baseline = copy.deepcopy(_build_config_snapshot())
 
 ffmpeg_path = app.get("ffmpeg_path", "")
 if ffmpeg_path and os.path.isfile(ffmpeg_path):

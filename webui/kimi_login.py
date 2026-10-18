@@ -6,7 +6,9 @@ import requests
 import streamlit as st
 from loguru import logger
 
+from app.config import config
 from app.services import kimi_code_oauth
+from webui import access_gate
 
 FLOW_KEY = "kimi_code_oauth_flow"
 PREPARED_KEY = "kimi_code_oauth_prepared"
@@ -44,7 +46,21 @@ def _prepare_link(region, tr):
     return prepared
 
 
+def _login_allowed():
+    """登录和断开会读写 OAuth 凭据，必须通过 WebUI 访问控制。
+
+    调用方（设置弹窗）已经做过检查；这里再检查一次，避免回调或 fragment
+    在页面被锁定后仍可被触发。
+    """
+    mode = access_gate.access_mode(config.app, st.get_option)
+    if mode == access_gate.MODE_GATED:
+        return bool(st.session_state.get(access_gate.AUTH_SESSION_KEY))
+    return access_gate.sensitive_features_enabled(mode)
+
+
 def _begin_login(prepared):
+    if not _login_allowed():
+        return
     st.session_state[FLOW_KEY] = dict(
         prepared,
         next_poll_at=time.time() + prepared["interval"],
@@ -119,6 +135,8 @@ def _cancel_login():
 
 
 def _disconnect():
+    if not _login_allowed():
+        return
     st.session_state.pop(FLOW_KEY, None)
     st.session_state.pop(PREPARED_KEY, None)
     st.session_state.pop(MESSAGE_KEY, None)
@@ -128,6 +146,8 @@ def _disconnect():
 @st.fragment(run_every="1s")
 def render_kimi_login(region, tr):
     """在设置弹窗中渲染登录；未点击登录前不请求 token。"""
+    if not _login_allowed():
+        return
     flow = st.session_state.get(FLOW_KEY)
     if flow and flow["region"] != region:
         # 用户切换站点后停止旧站点的待授权流程，旧凭据仍按原区域使用。

@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import secrets
 from typing import Annotated
 from uuid import uuid4
@@ -5,6 +7,7 @@ from uuid import uuid4
 from fastapi import Header, Request
 
 from app.config import config
+from app.controllers import rate_limit
 from app.models.exception import HttpException
 
 MAX_TASK_ID_LENGTH = 128
@@ -44,6 +47,48 @@ def get_api_key_values(request: Request) -> list[str]:
     return [api_key] if isinstance(api_key, str) else []
 
 
+def client_ip(request: Request) -> str:
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    return host if isinstance(host, str) and host else "unknown"
+
+
+def owner_fingerprint() -> str | None:
+    """Return a non-reversible fingerprint of the configured API key.
+
+    Tasks created through the API are stamped with it so list/get/delete can be
+    limited to the credential that created them. ``None`` means no key is
+    configured (single-tenant mode).
+    """
+    configured_key = config.app.get("api_key", "")
+    if not isinstance(configured_key, str) or not configured_key:
+        return None
+    return hmac.new(
+        configured_key.encode("utf-8"), b"moneyprinterturbo-task-owner-v1", hashlib.sha256
+    ).hexdigest()[:24]
+
+
+def rate_limit_client(request: Request) -> str:
+    """Bucket requests by the valid key's fingerprint, otherwise by client IP.
+
+    The caller-supplied key is never used as a bucket for invalid values, so
+    rotating bogus keys cannot reset an IP's allowance.
+    """
+    fingerprint = owner_fingerprint()
+    values = get_api_key_values(request)
+    configured_key = config.app.get("api_key", "")
+    if (
+        fingerprint
+        and len(values) == 1
+        and isinstance(configured_key, str)
+        and secrets.compare_digest(
+            values[0].encode("utf-8"), configured_key.encode("utf-8")
+        )
+    ):
+        return f"key:{fingerprint}"
+    return f"ip:{client_ip(request)}"
+
+
 def verify_token(
     request: Request,
     x_api_key: Annotated[str | None, Header(alias="x-api-key")] = None,
@@ -75,7 +120,19 @@ def verify_token(
     if not token_values and isinstance(x_api_key, str):
         token_values = [x_api_key]
 
+    # Throttle repeated failures per client address so the key cannot be
+    # brute-forced at wire speed. A blocked client is refused even with the
+    # right key until the window expires.
+    caller = client_ip(request)
+    if rate_limit.is_auth_blocked(caller):
+        raise HttpException(
+            task_id=get_task_id(request),
+            status_code=429,
+            message="too many failed authentication attempts",
+        )
+
     if len(token_values) != 1:
+        rate_limit.record_auth_failure(caller)
         raise HttpException(
             task_id=get_task_id(request),
             status_code=401,
@@ -89,6 +146,7 @@ def verify_token(
     if not secrets.compare_digest(
         token.encode("utf-8"), configured_key.encode("utf-8")
     ):
+        rate_limit.record_auth_failure(caller)
         raise HttpException(
             task_id=get_task_id(request),
             status_code=401,

@@ -26,7 +26,9 @@ def test_accepted_audio_requires_full_decode_and_preserves_previous_export(tmp_p
     with AudioFileClip(str(probe)) as clip:
         assert clip.duration > 0
     decoded = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(probe), "-f", "null", "-"], capture_output=True)
-    assert (decoded.returncode != 0) == corrupt
+    # FFmpeg 6.1 logs the decoder error but may still exit 0 under -xerror.
+    decode_failed = decoded.returncode != 0 or b"Decoder thread returned error" in decoded.stderr
+    assert decode_failed == corrupt
     seen = []
 
     class Handler(BaseHTTPRequestHandler):

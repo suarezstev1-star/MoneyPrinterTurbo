@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -249,4 +250,158 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
         deleted_count=deleted_count,
         deleted_size=deleted_size,
         failed_count=failed_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Periodic sweep: stale temp files + age/size (LRU) limits for cache_videos.
+# ---------------------------------------------------------------------------
+
+_SWEEP_INTERVAL_SECONDS = 60 * 60
+_DEFAULT_STALE_TEMP_HOURS = 6.0
+_DEFAULT_MAX_AGE_DAYS = 30.0
+_DEFAULT_MAX_SIZE_GB = 10.0
+# Never evict a clip touched this recently: a running task may be using it.
+_RECENT_USE_GUARD_SECONDS = 60 * 60
+_BYTES_PER_GB = 1024**3
+
+_sweep_lock = threading.Lock()
+_last_sweep_at: float | None = None
+
+
+@dataclass(frozen=True)
+class VideoCacheSweepResult:
+    """What one sweep removed; ``skipped`` means it was not yet due."""
+
+    skipped: bool = False
+    stale_temp_removed: int = 0
+    expired_removed: int = 0
+    evicted_removed: int = 0
+    freed_bytes: int = 0
+    failed_count: int = 0
+
+
+def _config_float(key: str, default: float) -> float:
+    try:
+        from app.config import config
+
+        value = float(config.app.get(key, default))
+    except (TypeError, ValueError, ImportError):
+        return default
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return default
+    return value
+
+
+def _delete_swept_entry(entry: _VideoCacheEntry, cache_dir: str) -> bool | None:
+    """Delete one scanned entry unless it changed; None means 'already gone'."""
+    if (
+        os.path.realpath(os.path.dirname(entry.path)) != cache_dir
+        or os.path.islink(entry.path)
+    ):
+        raise ValueError("cache file is outside the managed directory")
+    try:
+        current = os.stat(entry.path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(current.st_mode) or (
+        current.st_dev,
+        current.st_ino,
+        current.st_mtime_ns,
+        current.st_size,
+    ) != (entry.device, entry.inode, entry.mtime_ns, entry.size):
+        # Re-published or touched after the scan: someone is using it.
+        return False
+    os.unlink(entry.path)
+    return True
+
+
+def sweep(force: bool = False, now: float | None = None) -> VideoCacheSweepResult:
+    """
+    Remove abandoned temp files and enforce cache age/size limits.
+
+    Rate-limited to once per hour per process unless ``force``. Safe to call
+    from hot paths: when not due it returns immediately. Config keys (all under
+    ``[app]``): ``cache_stale_temp_hours`` (6), ``cache_max_age_days`` (30,
+    0 disables), ``cache_max_size_gb`` (10, 0 disables). Eviction is LRU by
+    modification time (cache hits refresh it) and never touches clips used
+    within the last hour.
+    """
+
+    global _last_sweep_at
+    current = time.time() if now is None else now
+    with _sweep_lock:
+        if (
+            not force
+            and _last_sweep_at is not None
+            and current - _last_sweep_at < _SWEEP_INTERVAL_SECONDS
+        ):
+            return VideoCacheSweepResult(skipped=True)
+        _last_sweep_at = current
+
+    stale_temp_seconds = _config_float(
+        "cache_stale_temp_hours", _DEFAULT_STALE_TEMP_HOURS
+    ) * 3600
+    max_age_days = _config_float("cache_max_age_days", _DEFAULT_MAX_AGE_DAYS)
+    max_bytes = int(_config_float("cache_max_size_gb", _DEFAULT_MAX_SIZE_GB) * _BYTES_PER_GB)
+    cache_dir = video_cache_dir()
+
+    stale_temp = expired = evicted = freed = failed = 0
+    survivors: list[_VideoCacheEntry] = []
+
+    def remove(entry: _VideoCacheEntry) -> bool:
+        nonlocal freed, failed
+        try:
+            outcome = _delete_swept_entry(entry, cache_dir)
+        except (OSError, ValueError) as exc:
+            failed += 1
+            logger.warning(
+                f"failed to sweep video cache file: file={entry.name}, error={exc}"
+            )
+            return False
+        if outcome:
+            freed += entry.size
+            return True
+        return False
+
+    try:
+        for entry in _iter_video_cache_entries(include_temp=True):
+            if _VIDEO_CACHE_TEMP_FILE_PATTERN.fullmatch(entry.name):
+                if entry.mtime < current - stale_temp_seconds and remove(entry):
+                    stale_temp += 1
+                continue
+            if (
+                max_age_days > 0
+                and entry.mtime < current - max_age_days * _SECONDS_PER_DAY
+                and remove(entry)
+            ):
+                expired += 1
+                continue
+            survivors.append(entry)
+
+        if max_bytes > 0:
+            total = sum(entry.size for entry in survivors)
+            for entry in sorted(survivors, key=lambda item: item.mtime):
+                if total <= max_bytes:
+                    break
+                if entry.mtime >= current - _RECENT_USE_GUARD_SECONDS:
+                    break
+                if remove(entry):
+                    evicted += 1
+                total -= entry.size
+    except Exception as exc:  # a sweep must never break a task
+        logger.warning(f"video cache sweep aborted: error={type(exc).__name__}, detail={exc}")
+
+    if stale_temp or expired or evicted:
+        logger.info(
+            "video cache sweep finished: "
+            f"stale_temp={stale_temp}, expired={expired}, evicted={evicted}, "
+            f"freed_bytes={freed}, failed={failed}"
+        )
+    return VideoCacheSweepResult(
+        stale_temp_removed=stale_temp,
+        expired_removed=expired,
+        evicted_removed=evicted,
+        freed_bytes=freed,
+        failed_count=failed,
     )

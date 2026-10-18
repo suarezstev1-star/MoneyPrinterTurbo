@@ -24,6 +24,57 @@ _task_manager = InMemoryTaskManager(
 _task_logs: dict[str, deque[str]] = {}
 _task_logs_lock = threading.RLock()
 _MAX_LOG_TASKS = 20
+# Per-browser-session cap on queued + running tasks, so one visitor cannot fill
+# the shared queue. Override with app.webui_max_tasks_per_session.
+DEFAULT_MAX_TASKS_PER_SESSION = 3
+_session_tasks: dict[str, set[str]] = {}
+_session_tasks_lock = threading.Lock()
+
+
+class SessionTaskLimitError(RuntimeError):
+    """Raised when one WebUI session already has too many active tasks."""
+
+    def __init__(self, limit: int):
+        super().__init__(
+            f"This session already has {limit} queued or running tasks."
+        )
+        self.limit = limit
+
+
+def max_tasks_per_session() -> int:
+    try:
+        return max(
+            1,
+            int(
+                config.app.get(
+                    "webui_max_tasks_per_session", DEFAULT_MAX_TASKS_PER_SESSION
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TASKS_PER_SESSION
+
+
+def _reserve_session_slot(session_id: str | None, task_id: str) -> None:
+    if not session_id:
+        return
+    limit = max_tasks_per_session()
+    with _session_tasks_lock:
+        active = _session_tasks.setdefault(session_id, set())
+        if task_id not in active and len(active) >= limit:
+            raise SessionTaskLimitError(limit)
+        active.add(task_id)
+
+
+def _release_session_slot(session_id: str | None, task_id: str) -> None:
+    if not session_id:
+        return
+    with _session_tasks_lock:
+        active = _session_tasks.get(session_id)
+        if active is not None:
+            active.discard(task_id)
+            if not active:
+                _session_tasks.pop(session_id, None)
 _MAX_LOG_RECORDS_PER_TASK = 1000
 # Streamlit 无法由后台线程直接推送组件更新，只能通过 Fragment 轮询。0.5 秒
 # 足以让 WebUI 日志接近终端实时输出，又不会像高频刷新那样持续占用浏览器资源。
@@ -60,6 +111,7 @@ def _run_generation(
     voxcpm_reference_audio: bytes | None = None,
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
+    session_id: str | None = None,
 ) -> dict:
     """
     在后台线程中执行现有视频流水线。
@@ -121,6 +173,7 @@ def _run_generation(
         )
         return failure
     finally:
+        _release_session_slot(session_id, task_id)
         if log_handler_id is not None:
             try:
                 logger.remove(log_handler_id)
@@ -139,6 +192,7 @@ def submit_generation(
     voxcpm_reference_audio: bytes | None = None,
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
+    session_id: str | None = None,
 ) -> None:
     """
     登记并提交 WebUI 视频生成任务，调用后立即返回。
@@ -146,6 +200,8 @@ def submit_generation(
     任务状态必须在线程启动前写入。这样页面本次脚本执行结束时即可查询到任务，
     浏览器刷新或 WebSocket 重连也不依赖旧页面内存中的占位符。
     """
+    # Reject before any state is written so a refused task leaves no record.
+    _reserve_session_slot(session_id, task_id)
     task_params = params.model_copy(deep=True)
     # The subtitle timeline and nested preview parameters remain mutable in
     # Streamlit session state. Snapshot them before this job enters the queue.
@@ -182,8 +238,10 @@ def submit_generation(
             voxcpm_reference_audio=voxcpm_reference_audio_snapshot,
             voxcpm_prompt_audio=voxcpm_prompt_audio_snapshot,
             voxcpm_prompt_text=voxcpm_prompt_text_snapshot,
+            session_id=session_id,
         )
     except Exception as exc:
+        _release_session_slot(session_id, task_id)
         # 调度失败与流水线失败一样必须成为可查询状态，避免任务管理器永久显示
         # “生成中”。保留异常类型便于从 Docker 或本机日志快速定位队列问题。
         error = f"{type(exc).__name__}: {exc}"
